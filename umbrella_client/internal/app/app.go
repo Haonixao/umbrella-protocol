@@ -25,6 +25,7 @@ import (
 	"umbrella_client/internal/client/decoy"
 	"umbrella_client/internal/client/hysteria"
 	"umbrella_client/internal/client/torrent"
+	"umbrella_client/internal/client/xhttp"
 	"umbrella_client/internal/client/xtls"
 	"umbrella_client/internal/logging"
 	"umbrella_client/internal/settings"
@@ -34,7 +35,7 @@ import (
 	"umbrella_client/internal/windows"
 )
 
-func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, appRef fyne.App, isRunning *bool, ctx context.Context, startEnabled, stopEnabled binding.Bool, onceLog *sync.Once, dnsCache *storage.DnsCache) {
+func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, appRef fyne.App, isRunning *bool, ctx context.Context, startEnabled, stopEnabled binding.Bool, onceLog *sync.Once) {
 	// Set up logging first to capture all output
 	onceLog.Do(func() {
 		log.SetOutput(&logging.LogWriter{LogsContainer: l})
@@ -75,9 +76,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 
 	// Log what will be started
 	l.AppendLog(fmt.Sprintf("Starting client on %s", cfg.ListenAddr))
-	if cfg.DNSListen != "" {
-		l.AppendLog(fmt.Sprintf("DNS server on %s", cfg.DNSListen))
-	}
+
 	if cfg.Shaper {
 		l.AppendLog("Traffic shaping: enabled")
 	}
@@ -115,14 +114,10 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 					l.AppendLog("[ERR] Tunnel core not stopped. Need a manual stop process. " + err.Error())
 				}
 			}
-			err := storage.SaveDnsCache(dnsCache, appSettings.AppFilesDir)
-			if err != nil {
-				l.AppendLog("[ERR] Failed save dns cache: " + err.Error())
-			}
 		}()
 
 		l.AppendLog("Starting client...")
-		var start func(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error
+		var start func(cfg *config.Config, ctx context.Context, appFilesDir string) error
 		switch cfg.Protocol {
 		case "xtls":
 			start = xtls.Start
@@ -130,11 +125,13 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 			start = hysteria.Start
 		case "torrent":
 			start = torrent.Start
+		case "xhttp":
+			start = xhttp.Start
 		default:
 			l.AppendLog("[ERR] Client failed to start: not valid protocol")
 			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
 		}
-		err = start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
+		err = start(cfg, ctx, appSettings.AppFilesDir)
 		if err != nil {
 			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
 				if runtime.GOOS != "android" {
@@ -156,7 +153,7 @@ func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, a
 							return
 						}
 					}
-					err = start(cfg, ctx, appSettings.AppFilesDir, dnsCache)
+					err = start(cfg, ctx, appSettings.AppFilesDir)
 				}
 			}
 
@@ -216,14 +213,16 @@ func CreateAndRun() {
 		candidates := []string{}
 		if ex, err := os.Executable(); err == nil {
 			ed := filepath.Dir(ex)
-			candidates = append(candidates,
+			candidates = append(
+				candidates,
 				filepath.Join(ed, "icon.png"),
 				filepath.Join(ed, "icon.ico"),
 				filepath.Join(ed, "Icon.png"),
 				filepath.Join(ed, "Icon.ico"),
 			)
 		}
-		candidates = append(candidates,
+		candidates = append(
+			candidates,
 			filepath.Join(appFilesDir, "icon.png"),
 			filepath.Join(appFilesDir, "Icon.png"),
 			filepath.Join(appFilesDir, "icon.ico"),
@@ -319,7 +318,6 @@ func CreateAndRun() {
 		if id < len(lg.Logs) {
 			msg := lg.Logs[id]
 			window.Clipboard().SetContent(msg)
-			myApp.SendNotification(fyne.NewNotification("Copied", "Log line copied to clipboard"))
 		}
 		lg.LogMu.RUnlock()
 		logList.Unselect(id)
@@ -330,7 +328,6 @@ func CreateAndRun() {
 		val := strings.Join(lg.Logs, "\n")
 		lg.LogMu.RUnlock()
 		window.Clipboard().SetContent(val)
-		myApp.SendNotification(fyne.NewNotification("Copied", "All logs copied"))
 	})
 
 	clearBtn := widget.NewButtonWithIcon("Clear", theme.DeleteIcon(), func() {
@@ -424,11 +421,6 @@ func CreateAndRun() {
 
 	isRunning := false
 
-	dnsCache, err := storage.LoadDnsCache(appSettings.AppFilesDir)
-	if err != nil {
-		lg.AppendLog("[ERR] Failed load dns cache. Created new: " + err.Error())
-	}
-
 	startBtn.OnTapped = func() {
 		if isRunning {
 			lg.AppendLog("[Warning] Start requested but client is already running")
@@ -441,7 +433,7 @@ func CreateAndRun() {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancelFunc = cancel
 		var onceLog sync.Once
-		go initAndStart(appSettings, lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog, dnsCache)
+		go initAndStart(appSettings, lg, myApp, &isRunning, ctx, startEnabled, stopEnabled, &onceLog)
 		if appSettings.Timer > 0 {
 			go func() {
 				var (
@@ -494,7 +486,7 @@ func CreateAndRun() {
 		if settingsWin != nil {
 			settingsWin.Close()
 		}
-		settingsWin = windows.NewSettingsWindow(myApp, appSettings, lg, dnsCache)
+		settingsWin = windows.NewSettingsWindow(myApp, appSettings, lg)
 		settingsWin.Show()
 	})
 

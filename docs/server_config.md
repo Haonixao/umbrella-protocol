@@ -1,105 +1,151 @@
-# Справочник параметров конфигурации сервера Umbrella
+# Umbrella Server Configuration Parameters Reference
 
-Сервер Umbrella управляется через файл `config.yaml`, который автоматически генерируется при первом запуске с настройками по умолчанию для протокола XTLS. Ниже приведено детальное описание всех доступных параметров.
+The Umbrella server is managed via the `config.yaml` file, which is automatically generated on the first run with default settings for the XTLS protocol. Below is a detailed description of all available parameters.
 
 ---
 
 ### protocol:
+
 ```yaml
 protocol: "xtls"
 ```
-Определяет активный протокол маскировки на сервере.
-- **Допустимые значения**: `"xtls"`, `"hysteria"`, `"torrent"`.
-- **По умолчанию**: `"xtls"`.
+
+Defines the active obfuscation protocol on the server.
+* **Allowed values** : `"xtls"`,   `"hysteria"`,   `"torrent"`,   `"xhttp"`.
+* **Default** : `"xtls"`.
 
 ### port:
+
 ```yaml
-port: "443" # или 1.2.3.4:50000-50100 для torrent
+port: "443" # or "50000-50100" for torrent
 ```
-Порт, который будет прослушивать сервер.
-- **Для Torrent**: Можно указывать диапазон портов (например, `50000-50100`), если включен Port Hopping.
-- **По умолчанию**: `"443"`.
+
+The port the server will listen on.
+* **For Torrent** : You can specify a port range (e.g.,   `"50000-50100"`) if Port Hopping is enabled.
+* **Default** : `"443"`.
 
 ### dest:
+
 ```yaml
 dest: "samsung.com:443"
 ```
-Fallback адрес. Все входящие соединения, не прошедшие авторизацию (без правильного Connection ID или PeerID), будут прозрачно перенаправлены на этот адрес. Это имитирует работу реального сервиса.
-- **По умолчанию**: `"samsung.com:443"`.
+
+Fallback address. All incoming connections that fail authorization (without a valid Connection ID, Short ID, or PeerID) will be transparently redirected to this address. This simulates the behavior of a real service.
+* **Default** : `"samsung.com:443"`.
 
 ### debug:
+
 ```yaml
 debug: false
 ```
-Включает расширенное логирование всех событий и ошибок в консоль сервера.
-- **По умолчанию**: `false`.
+
+Enables extended logging of all events and errors to the server console.
+* **Default** : `false`.
 
 ---
 
-## Раздел XTLS (Reality + Vision)
+## XHTTP Section (HTTP/2 & HTTP/3 Tunnel)
+
+### xhttp.auth-key:
+
+```yaml
+xhttp:
+  auth-key: "hex_string_32_bytes"
+```
+
+Secret key for HMAC authentication between client and server. If the client provides an invalid authentication token, the server redirects the request to the `dest` address.
+
+### xhttp.path:
+
+```yaml
+xhttp:
+  path: "/api/v1/update"
+```
+
+The HTTP path used for the tunnel. Requests to other paths will be handled according to the `dest` fallback logic.
+
+---
+
+## XTLS Section (Reality + Vision)
 
 ### xtls.private-key:
+
 ```yaml
 xtls:
   private-key: "YOUR_PRIVATE_KEY"
 ```
-Приватный ключ x25519 для технологии Reality. Генерируется автоматически при первом запуске.
+
+The x25519 private key for Reality technology. Generated automatically on the first run.
 
 ### xtls.short-id:
+
 ```yaml
 xtls:
   short-id: "hex_string"
 ```
-Разрешенный Short ID. Должен совпадать с настройками клиента. Генерируется автоматически при первом запуске.
+
+The allowed Short ID. Must match the client settings. Generated automatically on the first run.
 
 ### xtls.server-names:
+
 ```yaml
 xtls:
   server-names: "samsung.com,google.com"
 ```
-Список доменов (SNI), для которых сервер будет выдавать сертификаты Reality. По умолчанию берется из параметра `dest`.
+
+A list of domains (SNI) for which the server will issue Reality certificates. By default, it is taken from the `dest` parameter.
 
 ---
 
-## Раздел Hysteria (Hysteria 2)
+## Hysteria Section (Hysteria 2)
 
 ### hysteria.quic-port:
+
 ```yaml
 hysteria:
   quic-port: "8443"
 ```
-Внутренний UDP порт, на котором работает ядро Hysteria. Внешний порт определяется общим параметром `port`.
-- **По умолчанию**: `"8443"`.
+
+The internal UDP port where the Hysteria core operates. The external port is defined by the global `port` parameter.
+* **Default** : `"8443"`.
 
 ### hysteria.auth-key:
+
 ```yaml
 hysteria:
   auth-key: "hex_string_32_bytes"
 ```
-Ключ для проверки HMAC Connection ID. Если клиент присылает неверный ID, сервер перенаправляет трафик на `dest`.
+
+The key for HMAC Connection ID verification. If a client sends an invalid ID, the server redirects the traffic to `dest` .
 
 ### hysteria.auth-password:
+
 ```yaml
 hysteria:
   auth-password: "your_password"
 ```
-Пароль для стандартной аутентификации Hysteria 2.
+
+The password for standard Hysteria 2 protocol authentication.
 
 ---
 
-## Раздел Torrent (Torrent Stealth)
+## Torrent Section (Torrent Stealth)
 
 ### torrent.auth-key:
+
 ```yaml
 torrent:
   auth-key: "hex_string_32_bytes"
 ```
-Ключ для проверки HMAC PeerID. Позволяет отличить "своих" клиентов от случайных сканеров или реальных участников торрент-сети.
+
+The key for HMAC PeerID verification. Allows distinguishing "authorized" clients from random scanners or real torrent network participants.
 
 ### torrent.info-hash:
+
 ```yaml
 torrent:
   info-hash: "40_hex_chars"
 ```
-Инфо-хеш раздачи. Если оставить пустым, сервер будет генерировать случайный хеш при запуске.
-- **Рекомендация**: Укажите реальный хеш (например, Ubuntu), чтобы сервер выглядел как легитимный пир для этой раздачи.
+
+The info-hash of the torrent distribution. If left empty, the server will generate a random hash at startup.
+* **Recommendation** : Specify a real hash (e.g., a Linux distribution) so the server appears as a legitimate peer for that distribution.

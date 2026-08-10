@@ -1,92 +1,63 @@
-# Umbrella Client для Android — Настройка фоновой работы
+# Umbrella Client for Android — Background Work Configuration
 
-Для корректной работы `Umbrella Client` на Android необходимо выполнить ряд настроек, чтобы система не «убивала» приложение и не разрывала туннель.
+To ensure the correct operation of `Umbrella Client` on Android, several settings must be configured to prevent the system from "killing" the application and dropping the tunnel.
 
-> **⚠️ Предупреждение**
-> 
-> Описанные ниже изменения могут привести к **повышенному энергопотреблению** и более быстрой разрядке устройства.
-> 
-> Перед применением настроек рекомендуется:
-> - Изучить назначение каждой команды/параметра
-> - Запомнить или записать исходные значения изменяемых настроек
-> - Быть готовым вернуть настройки в исходное состояние после тестирования
-> 
-> **Автор не несёт ответственности за любые последствия, вызванные применением данных настроек.**
-
----
-
-## 1. Настройки энергопотребления устройства
-
-### Отключение ограничений оптимизации
-
-1. **Отключите все ограничения оптимизации** для `Umbrella_client`
-2. **Отключите «Адаптивный режим аккумулятора»**
-
-### Настройки режима разработчика
-
-В режиме разработчика:
-
-- **Выключите** «Приостановить исполнение кэшированных приложений»
-- **Включите** «Отключение ограничений для дочерних процессов»
-
-### Закрепление приложения
-
-На открытом окне с приложением активируйте **«Замок» (Keep open)** в меню многозадачности.
-
-> **Примечание:** Описанные названия пунктов меню присутствуют на смартфонах Samsung. На других устройствах названия могут отличаться, некоторых параметров может не быть или могут быть дополнительные. Принцип один: найти в настройках все пункты, которые отвечают за оптимизацию и ограничения, и исключить из них `Umbrella_client`.
+> **⚠️ Warning** 
+>  
+> The changes described below may lead to **increased power consumption** and faster battery drain.
+>  
+> Before applying these settings, it is recommended to:
+> - Study the purpose of each command/parameter
+> - Remember or write down the original values of the settings being changed
+> - Be prepared to revert the settings to their original state after testing
+>  
+> **The author is not responsible for any consequences caused by applying these settings.** 
 
 ---
 
-## 2. Команды ADB
+## 1. Device Power Settings
 
-Для стабильной работы фоновых процессов скачайте любую программу которая позволяет получить доступ к отладке и `abd shell` и выполните следующие команды:
+### Disabling Optimization Restrictions
+
+1. **Disable all optimization restrictions for** `Umbrella_client`
+2. **Disable "Adaptive Battery" mode** 
+
+### Developer Options Settings
+
+In Developer Options:
+
+* **Turn OFF** "Suspend execution for cached apps".
+* **Turn ON** "Disable child process restrictions".
+
+### Pinning the Application
+
+On the open application window, activate the **"Lock" (Keep open)** option in the multitasking (recent apps) menu.
+
+> **Note:** The menu names described above are specific to Samsung smartphones. On other devices, the names may differ, some parameters may be missing, or there may be additional ones. The principle remains the same: find all settings related to optimization and restrictions and exclude `Umbrella_client` from them.
+
+---
+
+## 2. ADB Commands
+
+For stable background process operation, download any application that provides access to debugging and `abd shell` , and execute the following commands:
 
 ```bash
-# Добавить приложение в whitelist Device Idle
+# Add the app to the Device Idle whitelist
 adb shell dumpsys deviceidle whitelist +com.umbrella.client
 
-# Разрешить работу в фоне
+# Allow running in the background
 adb shell appops set com.umbrella.client RUN_IN_BACKGROUND allow
 
-# Разрешить точные будильники
+# Allow exact alarms
 adb shell appops set com.umbrella.client SCHEDULE_EXACT_ALARM allow
 
-# Увеличить лимит phantom процессов
+# Increase the phantom process limit
 adb shell device_config put activity_manager max_phantom_processes 2147483647
 
-# Отключить cached apps freezer
+# Disable the cached apps freezer
 adb shell settings put global cached_apps_freezer disabled
 ```
 
 ---
 
-## 3. Поддержание активности туннеля
-
-Android может «засыпать» и обрывать туннель. Для предотвращения этого используйте приложения, которые периодически будят систему и процессор.
-
-### MacroDroid (рекомендуется)
-
-[MacroDroid](https://www.macrodroid.com/) — приложение для автоматизации задач на Android.
-
-**Создайте макрос со следующими параметрами:**
-
-| Параметр    | Значение                                                       |
-| ----------- | -------------------------------------------------------------- |
-| **Trigger** | Time/Date → Periodic → каждые 2 минуты                         |
-| **Action**  | HTTP Request → GET запрос (например, `https://www.google.com`) |
-
-**Обязательно выставить "Использовать будильник"**
-
-Этот макрос будет периодически отправлять HTTP-запрос, не давая системе уснуть и разорвать туннель.
-
-Скачать: [Google Play](https://play.google.com/store/apps/details?id=com.arlosoft.macrodroid)
-
-### Альтернативы
-
-- Любая альтернатива MacroDroid с аналогичным функционалом
-- [Doze Stopper](https://play.google.com/store/apps/details?id=jp.nittan.dozestopper) — для Android 11+
-- [Doze Buster](https://play.google.com/store/apps/details?id=jp.nittan.dozestopper) — для Android 10 и ниже
-
----
-
-## 4. Перед блокировкой экрана рекомендуется открыть окно с `Umbrella client`, чтобы оно было на переднем плане.
+## 3. Before locking the screen, it is recommended to have the `Umbrella client` window open in the foreground.

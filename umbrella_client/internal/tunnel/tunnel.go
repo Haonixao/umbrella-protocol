@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -24,26 +23,14 @@ func StartTunnelCore(path string, args string, logsContainer *logging.LogsContai
 		return nil, fmt.Errorf("tunnel core path is empty")
 	}
 
-	execName := filepath.Base(path)
-	execDir := filepath.Dir(path)
-
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command(path, strings.Fields(args)...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			HideWindow: true,
-		}
-	} else {
-		cmd = exec.Command(path, strings.Fields(args)...)
-	}
-	cmd.Dir = execDir
+	cmd := execCmd(path, strings.Fields(args)...)
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start tunnel core: %w", err)
 	}
 
 	tunnelCoreProcess := cmd.Process
-	logsContainer.AppendLog("Tunnel core started: " + execName)
+	logsContainer.AppendLog("Tunnel core started: " + path)
 	return tunnelCoreProcess, nil
 }
 

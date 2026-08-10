@@ -48,7 +48,6 @@ func NewPresetsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *log
 					return
 				}
 				l.AppendLog("Loaded preset: " + name)
-				appRef.SendNotification(fyne.NewNotification("Preset Loaded", name))
 				presetListBox.Refresh()
 				currentPresetLbl.SetText("Current preset: " + appSettings.CurrentPreset)
 			}),
@@ -59,7 +58,6 @@ func NewPresetsWindow(appRef fyne.App, appSettings *settings.AppSettings, l *log
 					return
 				}
 				l.AppendLog("Overwrited preset: " + name)
-				appRef.SendNotification(fyne.NewNotification("Preset Overwrited", name))
 				presetListBox.Refresh()
 				currentPresetLbl.SetText("Current preset: " + appSettings.CurrentPreset)
 			}),

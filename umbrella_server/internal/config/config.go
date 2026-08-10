@@ -15,6 +15,11 @@ type Config struct {
 	Dest     string `yaml:"dest"`
 	Debug    bool   `yaml:"debug"`
 
+	Xhttp struct {
+		AuthKey string `yaml:"auth-key"`
+		Path    string `yaml:"path"`
+	} `yaml:"xhttp"`
+
 	Xtls struct {
 		PrivateKey  string `yaml:"private-key"`
 		ShortId     string `yaml:"short-id"`
@@ -60,7 +65,7 @@ func createDefaultConfig(path string) (*Config, error) {
 	// Генерация ключей для дефолтного конфига
 	privKey := make([]byte, 32)
 	importRand.Read(privKey)
-	
+
 	shortId := make([]byte, 8)
 	importRand.Read(shortId)
 
@@ -77,7 +82,7 @@ func createDefaultConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0o644); err != nil {
 		return nil, err
 	}
 

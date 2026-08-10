@@ -7,6 +7,7 @@ import (
 	"umbrella_server/internal/config"
 	"umbrella_server/internal/hysteria"
 	"umbrella_server/internal/torrent"
+	"umbrella_server/internal/xhttp"
 	"umbrella_server/internal/xtls"
 )
 
@@ -26,6 +27,8 @@ func main() {
 		hysteria.HysteriaStarter(cfg)
 	case "torrent":
 		torrent.TorrentStarter(cfg)
+	case "xhttp":
+		xhttp.XhttpStarter(cfg)
 	default:
 		log.Fatalf("[ERR] Not valid protocol in config")
 	}

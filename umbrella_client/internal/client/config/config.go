@@ -26,6 +26,13 @@ type Config struct {
 		SessionsNum        int    `yaml:"sessions-num"`
 	} `yaml:"xtls"`
 
+	Xhttp struct {
+		AuthKey string `yaml:"auth-key"`
+		Quic    bool   `yaml:"quic"`
+		Path    string `yaml:"path"`
+		Mode    string `yaml:"mode"` // stream-one, stream-up, packet-up
+	} `yaml:"xhttp"`
+
 	Hysteria struct {
 		AuthKey      string `yaml:"auth-key"`
 		AuthPassword string `yaml:"auth-password"`
@@ -39,9 +46,7 @@ type Config struct {
 		ConnectionsTimeOut int    `yaml:"connections-time-out"`
 	} `yaml:"torrent"`
 
-	Bypass      []string `yaml:"bypass"`
-	DNSListen   string   `yaml:"dns-listen"`
-	DNSUpstream string   `yaml:"dns-upstream"`
+	Bypass []string `yaml:"bypass"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -53,10 +58,7 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func ParseConfig(data []byte) (*Config, error) {
-	cfg := &Config{
-		DNSListen:   "",
-		DNSUpstream: "8.8.8.8:53",
-	}
+	cfg := &Config{}
 
 	cfg.SNI = "github.com"
 	cfg.ListenAddr = "0.0.0.0:1080"
@@ -66,13 +68,13 @@ func ParseConfig(data []byte) (*Config, error) {
 	cfg.Shaper = false
 	cfg.PhasesFile = "phases.yml"
 
-	cfg.Xtls.ConnectionsTimeOut = 60
-	cfg.Xtls.SessionsNum = 5
+	cfg.Xtls.ConnectionsTimeOut = 70
+	cfg.Xtls.SessionsNum = 2
 
-	cfg.Hysteria.ConnsNum = 5
+	cfg.Hysteria.ConnsNum = 2
 
-	cfg.Torrent.SessionsNum = 5
-	cfg.Torrent.ConnectionsTimeOut = 60
+	cfg.Torrent.SessionsNum = 2
+	cfg.Torrent.ConnectionsTimeOut = 70
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err

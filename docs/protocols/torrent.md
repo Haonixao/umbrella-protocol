@@ -1,63 +1,56 @@
-# 🚚 Torrent Stealth (Umbrella Edition)
+# Torrent Stealth (Umbrella variant)
 
-Torrent Stealth — это уникальный протокол Umbrella, разработанный для максимальной выживаемости в условиях, когда блокируются все известные VPN-протоколы.
+Torrent Stealth is a unique Umbrella protocol designed for maximum survivability in environments where all known VPN protocols are blocked.
 
-## Конфигурация
+## Configuration
 
-Для активации этого режима используйте `protocol: torrent` в конфигурационных файлах.
+To activate this mode, use `protocol: torrent` in your configuration files.
 
-### Сервер (config.yaml)
+### Server (config.yaml)
+
 ```yaml
 protocol: "torrent"
-port: "50000-50100"         # Диапазон для Port Hopping
+port: "50000-50100"         # Range for Port Hopping
 
 torrent:
-  auth-key: "..."      # HMAC ключ для аутентификации (hex, 32 байта)
-  info-hash: "..."     # Хеш раздачи (40 hex chars). Если пусто - генерируется случайно.
+  auth-key: "..."      # HMAC key for authentication (hex, 32 bytes)
+  info-hash: "..."     # Info hash (40 hex chars). If empty, generated randomly.
 ```
 
-### Клиент (config.yaml)
+### Client (config.yaml)
+
 ```yaml
 protocol: "torrent"
-server: "your_vps_ip:50000-50100" # Должен совпадать с сервером
+server: "your_vps_ip:50000-50100" # Must match the server range
 listen: "0.0.0.0:1080"
-udp: true
 
 torrent:
-  auth-key: "..."      # Должен совпадать с сервером
-  info-hash: "..."     # Для лучшей маскировки укажите хеш реального торрента (напр. Ubuntu)
-  sessions-num: 5
-  connections-time-out: 60
+  auth-key: "..."      # Must match the server
+  info-hash: "..."     # For better masking, use the hash of a real torrent (e.g., Ubuntu)
 ```
 
-## Почему это работает?
+## Why It Works
 
-### 1. Уникальная аутентификация
-В отличие от обычных прокси, Umbrella Torrent проверяет клиента на этапе BitTorrent-рукопожатия:
-*   **HMAC PeerID**: Клиент формирует свой `PeerID` из Nonce и HMAC-подписи. Сервер проверяет валидность этой подписи с помощью секретного `auth-key`.
-*   **Скрытность**: Если подпись неверна, сервер не обрывает соединение, а переходит в **Decoy Mode**.
+### 1. Unique Authentication
 
-### 2. Decoy Mode (Защита от прощупывания)
-Если на порт сервера заходит сторонний сканер или реальный торрент-клиент:
-*   Сервер прикидывается обычным сидом (Peer).
-*   Он принимает запросы `request` на скачивание кусков файла.
-*   В ответ сервер отправляет **сообщения `piece` со случайными данными**. Для внешнего наблюдателя это выглядит как передача зашифрованных фрагментов реального файла.
+Unlike standard proxies, Umbrella Torrent validates the client during the BitTorrent handshake stage:
+* **HMAC PeerID** : The client generates its `PeerID` using a Nonce and an HMAC signature. The server verifies this signature using the secret `auth-key`.
+* **Stealth**: If the signature is invalid, the server does not drop the connection; instead, it switches to **Decoy Mode** .
 
-### 3. White Noise (Белый шум)
-Чтобы ваш IP не выглядел как точка, общающаяся только с одним сервером, клиент:
-*   Периодически отправляет `Announce` запросы на реальные мировые трекеры.
-*   Использует тот же `InfoHash`, что и для связи с сервером.
-*   **Совет:** Если указать в конфиге хеш актуального образа Ubuntu или Debian, ваше поведение в сети будет полностью идентично поведению легитимного пользователя BitTorrent.
+### 2. Decoy Mode (Anti-Probing Protection)
 
-### 4. Piece Framing + Padding
-Все ваши данные (TCP/UDP/DNS) упаковываются в стандартные BitTorrent `piece` сообщения (ID 7).
-*   **Random Padding:** В каждое сообщение добавляется от 0 до 255 байт случайного мусора.
-*   Это делает длину каждого пакета уникальной и непредсказуемой, ломая любые статистические сигнатуры длин пакетов.
+If an external scanner or a real torrent client accesses the server port:
+*   The server pretends to be a normal seed (Peer).
+*   It accepts `request` messages to download file pieces.
+*   In response, the server sends **`piece` messages containing random data** . To an external observer, this looks like the transmission of encrypted fragments of a real file.
 
-### 5. Port Hopping & Ротация
-Клиент выбирает случайный порт из заданного диапазона при каждой новой сессии. Кроме того, каждая сессия автоматически ротируется через случайный промежуток времени (от 3 до 15 минут). Это делает блокировку по конкретному порту неэффективной и имитирует естественное переключение между разными пирами в торрент-сети.
+### 3. Piece Framing + Padding
 
-## Когда использовать?
-*   "Режим выживания": когда заблокировано всё остальное.
-*   Если вам нужна максимальная скрытность.
-*   Для обхода блокировок в сетях, где торренты разрешены, а VPN — нет.
+All your data (TCP/UDP/DNS) is encapsulated into standard BitTorrent `piece` messages (ID 7).
+
+* **Random Padding:** Between 0 and 255 bytes of random "junk" are added to each message.
+*   This makes the length of every packet unique and unpredictable, breaking any statistical packet length signatures.
+
+### 5. Port Hopping & Rotation
+
+The client selects a random port from the specified range for every new session. Additionally, each session is automatically rotated after a random interval. This makes blocking a specific port ineffective and simulates the natural behavior of switching between different peers in a torrent network.

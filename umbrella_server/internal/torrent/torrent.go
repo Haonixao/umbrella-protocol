@@ -2,9 +2,12 @@ package torrent
 
 import (
 	"bufio"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -16,7 +19,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
 	"umbrella_server/internal/config"
 
 	"github.com/anacrolix/utp"
@@ -119,115 +121,85 @@ func handleTorrentConn(conn net.Conn) {
 	}
 
 	clientInfoHash := handshake[28:48]
-	peerID := handshake[48:68]
+	peerID := handshake[48:68] // Последние 20 байт
 
-	// 2. Verify HMAC in PeerID
-	nonce := peerID[8:12]
-	signature := peerID[12:20]
+	// --- НОВАЯ ЛОГИКА АВТОРИЗАЦИИ ---
 
+	// 1. Извлекаем компоненты из PeerID
+	// [0:8]   = "-TR4000-" (статический префикс)
+	// [8:12]  = Rnd (4 байта)
+	// [12:15] = MaskedTime (3 байта)
+	// [15:20] = Signature (5 байт)
+
+	rnd := peerID[8:12]
+	maskedTime := peerID[12:15]
+	signature := peerID[15:20]
+
+	// 2. Снимаем маску XOR с времени, используя rnd
+	minBytes := make([]byte, 3)
+	for i := 0; i < 3; i++ {
+		minBytes[i] = maskedTime[i] ^ rnd[i]
+	}
+
+	// 3. Проверяем временное окно (UTC)
+	minutesSinceYearStart := uint32(minBytes[0])<<16 | uint32(minBytes[1])<<8 | uint32(minBytes[2])
+	now := time.Now().UTC()
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	clientTime := yearStart.Add(time.Duration(minutesSinceYearStart) * time.Minute)
+
+	// Окно ± 2.5 минуты
+	if now.Sub(clientTime).Abs() > 2*time.Minute+30*time.Second {
+		log.Printf("[INFO] Decoy: time drift too high from %s", conn.RemoteAddr())
+		beRealTorrentPeer(conn, clientInfoHash)
+		return
+	}
+
+	// 4. Проверяем подпись HMAC (rnd + real_minutes + infohash)
 	mac := hmac.New(sha1.New, gAuthKey)
-	mac.Write(nonce)
+	mac.Write(rnd)
+	mac.Write(minBytes)
 	mac.Write(clientInfoHash)
-	expectedSig := mac.Sum(nil)[:8]
+	expectedSig := mac.Sum(nil)[:5]
 
 	if hmac.Equal(signature, expectedSig) {
-		// Valid Umbrella Client
+		// Успешная авторизация
 		respHandshake := make([]byte, handshakeLen)
 		respHandshake[0] = pstrlen
 		copy(respHandshake[1:20], pstr)
 		copy(respHandshake[28:48], clientInfoHash)
-		copy(respHandshake[48:68], []byte("-UM1000-012345678901"))
+		copy(respHandshake[48:56], []byte("-UM1000-"))
+		rand.Read(respHandshake[56:68])
 		conn.Write(respHandshake)
 
-		handleUmbrellaSess(conn)
+		// Передаем rnd в качестве nonce для инициализации AES-CTR
+		handleUmbrellaSess(conn, rnd)
 	} else {
-		// Foreign Client - Decoy Mode
+		// Неверная подпись — уходим в режим приманки
 		beRealTorrentPeer(conn, clientInfoHash)
 	}
 }
 
-func beRealTorrentPeer(conn net.Conn, infoHash []byte) {
-	defer conn.Close()
-	log.Printf("[INFO] Decoy: unknown client from %s with infohash %s", conn.RemoteAddr(), hex.EncodeToString(infoHash))
-
-	// 1. Send fake handshake back
-	respHandshake := make([]byte, handshakeLen)
-	respHandshake[0] = pstrlen
-	copy(respHandshake[1:20], pstr)
-	copy(respHandshake[28:48], infoHash)
-	copy(respHandshake[48:68], []byte("-TR3000-012345678901"))
-	if _, err := conn.Write(respHandshake); err != nil {
-		return
-	}
-
-	// 2. Send Bitfield
-	bitfieldSize := 128
-	bf := make([]byte, 4+1+bitfieldSize)
-	binary.BigEndian.PutUint32(bf[0:4], uint32(1+bitfieldSize))
-	bf[4] = bitfieldID
-	for i := 0; i < bitfieldSize; i++ {
-		bf[5+i] = 0xFF
-	}
-	conn.Write(bf)
-
-	// 3. Send Unchoke
-	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
-
-	// 4. Handle incoming messages in a blocking way
-	buf := make([]byte, 4096)
-	for {
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		n, err := conn.Read(buf)
-		if err != nil {
-			return
-		}
-		if n >= 4 {
-			msgLen := binary.BigEndian.Uint32(buf[:4])
-			if msgLen == 0 { // keep-alive
-				conn.Write([]byte{0, 0, 0, 0})
-				continue
-			}
-			if n >= 5 {
-				msgID := buf[4]
-				if msgID == requestID && n >= 17 {
-					index := binary.BigEndian.Uint32(buf[5:9])
-					begin := binary.BigEndian.Uint32(buf[9:13])
-					length := binary.BigEndian.Uint32(buf[13:17])
-
-					if length <= 32768 {
-						pieceBuf := make([]byte, 4+1+4+4+int(length))
-						binary.BigEndian.PutUint32(pieceBuf[0:4], uint32(9+length))
-						pieceBuf[4] = pieceMsgID
-						binary.BigEndian.PutUint32(pieceBuf[5:9], index)
-						binary.BigEndian.PutUint32(pieceBuf[9:13], begin)
-						rand.Read(pieceBuf[13:])
-						conn.Write(pieceBuf)
-					}
-				}
-			}
-		}
-	}
-}
-
-func handleUmbrellaSess(conn net.Conn) {
+func handleUmbrellaSess(conn net.Conn, nonce []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Panic] handleUmbrellaSess from %s: %v", conn.RemoteAddr(), r)
 		}
 	}()
-	// 1. Send Bitfield and Unchoke for mask symmetry
-	bitfieldSize := 128
+
+	bitfieldSize := 100 + mrand.Intn(400)
 	bf := make([]byte, 4+1+bitfieldSize)
 	binary.BigEndian.PutUint32(bf[0:4], uint32(1+bitfieldSize))
 	bf[4] = bitfieldID
 	for i := 0; i < bitfieldSize; i++ {
 		bf[5+i] = 0xFF
 	}
+	for i := 0; i < 3; i++ {
+		bf[5+mrand.Intn(bitfieldSize)] &= ^(1 << uint(mrand.Intn(8)))
+	}
 	conn.Write(bf)
 	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
 
-	// Wrap connection with piece framing
-	tConn := NewTorrentConn(conn)
+	tConn := NewTorrentConn(conn, gAuthKey, gInfoHash, nonce)
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
@@ -260,7 +232,6 @@ func handleStream(stream net.Conn, clientAddr net.Addr) {
 		stream.Close()
 	}()
 
-	// 1. Read target address
 	lenBuf := make([]byte, 4)
 	if _, err := io.ReadFull(stream, lenBuf); err != nil {
 		return
@@ -326,12 +297,15 @@ func handleUDPRelay(stream net.Conn) {
 	const idleTimeout = 30 * time.Second
 	done := make(chan struct{})
 
-	// App -> Server
 	go func() {
 		defer close(done)
 		lenBuf := make([]byte, 4)
 		addrCache := make(map[string]*net.UDPAddr)
-		payloadBuf := make([]byte, 65535)
+
+		bufPtr := udpBufPool.Get().(*[]byte)
+		defer udpBufPool.Put(bufPtr)
+		payloadBuf := *bufPtr
+
 		for {
 			stream.SetReadDeadline(time.Now().Add(idleTimeout))
 			if _, err := io.ReadFull(stream, lenBuf); err != nil {
@@ -346,27 +320,26 @@ func handleUDPRelay(stream net.Conn) {
 				return
 			}
 
-			// Simple SOCKS5 UDP framing: [ATYP][ADDR][PORT][DATA]
 			if len(payload) < 4 {
 				continue
 			}
 			off := 0
 			var host string
 			switch payload[off] {
-			case 0x01: // IPv4
+			case 0x01:
 				if len(payload) < 7 {
 					continue
 				}
 				host = net.IP(payload[1:5]).String()
 				off = 5
-			case 0x03: // Domain
+			case 0x03:
 				nameLen := int(payload[1])
 				if len(payload) < 2+nameLen+2 {
 					continue
 				}
 				host = string(payload[2 : 2+nameLen])
 				off = 2 + nameLen
-			case 0x04: // IPv6
+			case 0x04:
 				if len(payload) < 19 {
 					continue
 				}
@@ -382,7 +355,7 @@ func handleUDPRelay(stream net.Conn) {
 			addr, ok := addrCache[target]
 			if !ok {
 				addr, _ = net.ResolveUDPAddr("udp", target)
-				if len(addrCache) > 1000 { // Ограничиваем кэш, чтобы не было утечки
+				if len(addrCache) > 1000 {
 					for k := range addrCache {
 						delete(addrCache, k)
 						break
@@ -397,9 +370,14 @@ func handleUDPRelay(stream net.Conn) {
 		}
 	}()
 
-	// Server -> App
-	buf := make([]byte, 65535)
-	frameBuf := make([]byte, 4+1+16+2+65535)
+	bufPtr := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	frameBufPtr := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(frameBufPtr)
+	frameBuf := *frameBufPtr
+
 	for {
 		select {
 		case <-done:
@@ -449,7 +427,6 @@ func handleDNSQuery(stream net.Conn, clientAddr net.Addr) {
 		return
 	}
 
-	// Парсим адрес DNS-сервера (Upstream), присланный клиентом
 	off := 0
 	var host string
 	switch payload[off] {
@@ -471,7 +448,6 @@ func handleDNSQuery(stream net.Conn, clientAddr net.Addr) {
 
 	target := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	// Выполняем запрос к DNS-апстриму, который выбрал клиент
 	conn, err := net.DialTimeout("udp", target, 5*time.Second)
 	if err != nil {
 		return
@@ -489,19 +465,15 @@ func handleDNSQuery(stream net.Conn, clientAddr net.Addr) {
 		return
 	}
 
-	// Возвращаем ответ сервера клиенту в формате [ATYP][ADDR][PORT][DNS_DATA]
-	// Используем clientAddr для формирования заголовока
-	headerBuf := make([]byte, 4+1+16+2+len(resp)) // Объединяем в один буфер
+	headerBuf := make([]byte, 4+1+16+2+len(resp))
 	off = 4
 
-	// Безопасное извлечение IP и порта из clientAddr (может быть utp.addr)
 	var udpSrcIP net.IP
 	var udpSrcPort int
 	if ua, ok := clientAddr.(*net.UDPAddr); ok {
 		udpSrcIP = ua.IP
 		udpSrcPort = ua.Port
 	} else {
-		// Парсим из строки, если это специфичный тип адреса uTP
 		h, pStr, _ := net.SplitHostPort(clientAddr.String())
 		udpSrcIP = net.ParseIP(h)
 		udpSrcPort, _ = strconv.Atoi(pStr)
@@ -518,14 +490,68 @@ func handleDNSQuery(stream net.Conn, clientAddr net.Addr) {
 	}
 	binary.BigEndian.PutUint16(headerBuf[off:off+2], uint16(udpSrcPort))
 	off += 2
-
 	copy(headerBuf[off:], resp[:n])
 	off += n
-
 	binary.BigEndian.PutUint32(headerBuf[0:4], uint32(off-4))
 
-	if _, err := stream.Write(headerBuf[:off]); err != nil {
+	stream.Write(headerBuf[:off])
+}
+
+func beRealTorrentPeer(conn net.Conn, infoHash []byte) {
+	defer conn.Close()
+	log.Printf("[INFO] Decoy: unknown client from %s with infohash %s", conn.RemoteAddr(), hex.EncodeToString(infoHash))
+
+	respHandshake := make([]byte, handshakeLen)
+	respHandshake[0] = pstrlen
+	copy(respHandshake[1:20], pstr)
+	copy(respHandshake[28:48], infoHash)
+	copy(respHandshake[48:56], []byte("-TR3000-"))
+	rand.Read(respHandshake[56:68])
+	if _, err := conn.Write(respHandshake); err != nil {
 		return
+	}
+
+	bitfieldSize := 100 + mrand.Intn(400)
+	bf := make([]byte, 4+1+bitfieldSize)
+	binary.BigEndian.PutUint32(bf[0:4], uint32(1+bitfieldSize))
+	bf[4] = bitfieldID
+	for i := 0; i < bitfieldSize; i++ {
+		bf[5+i] = 0xFF
+	}
+	for i := 0; i < 3; i++ {
+		bf[5+mrand.Intn(bitfieldSize)] &= ^(1 << uint(mrand.Intn(8)))
+	}
+	conn.Write(bf)
+	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
+
+	buf := make([]byte, 4096)
+	for {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(buf)
+		if err != nil {
+			return
+		}
+		if n >= 4 {
+			msgLen := binary.BigEndian.Uint32(buf[:4])
+			if msgLen == 0 {
+				conn.Write([]byte{0, 0, 0, 0})
+				continue
+			}
+			if n >= 5 && buf[4] == requestID && n >= 17 {
+				index := binary.BigEndian.Uint32(buf[5:9])
+				begin := binary.BigEndian.Uint32(buf[9:13])
+				length := binary.BigEndian.Uint32(buf[13:17])
+				if length <= 32768 {
+					pieceBuf := make([]byte, 4+1+4+4+int(length))
+					binary.BigEndian.PutUint32(pieceBuf[0:4], uint32(9+length))
+					pieceBuf[4] = pieceMsgID
+					binary.BigEndian.PutUint32(pieceBuf[5:9], index)
+					binary.BigEndian.PutUint32(pieceBuf[9:13], begin)
+					rand.Read(pieceBuf[13:])
+					conn.Write(pieceBuf)
+				}
+			}
+		}
 	}
 }
 
@@ -537,24 +563,30 @@ type TorrentConn struct {
 	remainingPadding int
 	flushTimer       *time.Timer
 	mu               sync.Mutex
+	enc              cipher.Stream
+	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
+	}
+	key := sha256.Sum256(authKey)
+	ivSeed := append(nonce, infoHash[:]...)
+	iv := sha256.Sum256(ivSeed)
+	block, err := aes.NewCipher(key[:])
+	if err == nil {
+		tc.enc = cipher.NewCTR(block, iv[16:32])
+		tc.dec = cipher.NewCTR(block, iv[:16])
 	}
 	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
 	return tc
 }
 
-type rawPieceWriter struct {
-	tc *TorrentConn
-}
+type rawPieceWriter struct{ tc *TorrentConn }
 
-func (w *rawPieceWriter) Write(p []byte) (int, error) {
-	return w.tc.writePiece(p)
-}
+func (w *rawPieceWriter) Write(p []byte) (int, error) { return w.tc.writePiece(p) }
 
 func (c *TorrentConn) Read(p []byte) (n int, err error) {
 	for {
@@ -567,17 +599,18 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			if err != nil {
 				return n, err
 			}
+			if c.dec != nil {
+				c.dec.XORKeyStream(p[:n], p[:n])
+			}
 			c.remainingPayload -= n
 			return n, nil
 		}
-
 		if c.remainingPadding > 0 {
 			if _, err := c.reader.Discard(c.remainingPadding); err != nil {
 				return 0, err
 			}
 			c.remainingPadding = 0
 		}
-
 		var header [4]byte
 		if _, err := io.ReadFull(c.reader, header[:]); err != nil {
 			return 0, err
@@ -586,31 +619,25 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 		if length == 0 {
 			continue
 		}
-
 		msgID, err := c.reader.ReadByte()
 		if err != nil {
 			return 0, err
 		}
-
 		if msgID == pieceMsgID {
 			if _, err := c.reader.Discard(8); err != nil {
 				return 0, err
 			}
-
 			var pLenBuf [2]byte
 			if _, err := io.ReadFull(c.reader, pLenBuf[:]); err != nil {
 				return 0, err
 			}
 			pLen := int(binary.BigEndian.Uint16(pLenBuf[:]))
-
 			totalInPiece := int(length) - 11
 			if pLen > totalInPiece {
-				return 0, fmt.Errorf("torrent protocol corruption: payload %d > total %d", pLen, totalInPiece)
+				return 0, fmt.Errorf("torrent protocol corruption")
 			}
-
 			c.remainingPayload = pLen
 			c.remainingPadding = totalInPiece - pLen
-
 			if c.remainingPayload == 0 {
 				continue
 			}
@@ -640,24 +667,23 @@ func (c *TorrentConn) Write(p []byte) (n int, err error) {
 func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	const internalHeadLen = 2
 	padLen := mrand.Intn(256)
-
 	bufPtr := udpBufPool.Get().(*[]byte)
 	defer udpBufPool.Put(bufPtr)
 	buf := *bufPtr
-
 	totalMsgLen := 9 + internalHeadLen + len(p) + padLen
 	binary.BigEndian.PutUint32(buf[0:4], uint32(totalMsgLen))
 	buf[4] = pieceMsgID
-	binary.BigEndian.PutUint32(buf[5:9], 0)
-	binary.BigEndian.PutUint32(buf[9:13], 0)
-
+	binary.BigEndian.PutUint32(buf[5:9], uint32(mrand.Int31n(1000)))
+	binary.BigEndian.PutUint32(buf[9:13], uint32(mrand.Int31n(131072)))
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(p)))
-	copy(buf[15:], p)
-
+	if c.enc != nil {
+		c.enc.XORKeyStream(buf[15:15+len(p)], p)
+	} else {
+		copy(buf[15:], p)
+	}
 	if padLen > 0 {
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])
 	}
-
 	_, err = c.Conn.Write(buf[:4+totalMsgLen])
 	return len(p), err
 }

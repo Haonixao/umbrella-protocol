@@ -12,7 +12,15 @@ import (
 )
 
 func main() {
-	serverAddrStr := "138.124.240.89:443"
+	for {
+		if res := test(); res {
+			break
+		}
+	}
+}
+
+func test() bool {
+	serverAddrStr := "0.0.0.0:443"
 	timeout := 10 * time.Second
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -20,29 +28,32 @@ func main() {
 
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, // Для теста проксирования обычно ставим true, если не уверены в CA
-		ServerName:        "cloudflare.com",
-		NextProtos:        []string{"h3", "h2", "http/1.1"},
+		ServerName:         "coder.com",
+		NextProtos:         []string{"h3", "h2", "http/1.1"},
 	}
 
 	quicConfig := &quic.Config{
-		MaxIdleTimeout: timeout,
+		MaxIdleTimeout:  timeout,
 		KeepAlivePeriod: time.Second,
 	}
 
 	udpConn, err := net.ListenUDP("udp", nil)
 	if err != nil {
-		log.Fatalf("create UDP listener: %v", err)
+		log.Printf("create UDP listener: %v\n", err)
+		return false
 	}
 	defer udpConn.Close()
 
 	serverAddr, err := net.ResolveUDPAddr("udp", serverAddrStr)
 	if err != nil {
-		log.Fatalf("resolve server addr: %v", err)
+		log.Printf("resolve server addr: %v\n", err)
+		return false
 	}
 
 	conn, err := quic.Dial(ctx, udpConn, serverAddr, tlsConfig, quicConfig)
 	if err != nil {
-		log.Fatalf("QUIC dial failed: %v", err)
+		log.Printf("QUIC dial failed: %v\n", err)
+		return false
 	}
 	defer conn.CloseWithError(0, "test done")
 
@@ -71,6 +82,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== Test Passed: Connection established and certificate received ===")
+	return true
 }
 
 func tlsVersionToString(v uint16) string {

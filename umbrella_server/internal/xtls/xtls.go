@@ -21,7 +21,10 @@ import (
 	"github.com/xtls/reality"
 )
 
-var copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+var (
+	copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+	udpBufPool  = sync.Pool{New: func() any { b := make([]byte, 66*1024); return &b }}
+)
 
 func XtlsStarter(cfg *config.Config) {
 	privKeyBytes := make([]byte, 32)
@@ -125,67 +128,92 @@ func handleVisionUDP(stream net.Conn) error {
 	go func() {
 		addrCache := make(map[string]*net.UDPAddr)
 		for {
-			payload, err := visionReadDatagram(stream)
+			payload, bufPtr, err := visionReadDatagram(stream)
 			if err != nil {
-				go pc.Close()
+				go pc.Close() // Закрываем сокет, чтобы прервать ReadFrom в основном потоке
 				return
 			}
-			if len(payload) < 4 {
-				continue
-			}
-			var host string
-			var addrEnd int
-			switch payload[0] {
-			case 0x01:
-				if len(payload) < 7 {
-					continue
+
+			// Важно: возвращаем буфер в пул в конце каждой итерации
+			// Используем defer внутри анонимной функции или просто Put в конце
+			func() {
+				defer udpBufPool.Put(bufPtr)
+
+				if len(payload) < 4 {
+					return
 				}
-				host = net.IP(payload[1:5]).String()
-				addrEnd = 5
-			case 0x03:
-				if len(payload) < 3 {
-					continue
+
+				var host string
+				var addrEnd int
+				switch payload[0] {
+				case 0x01:
+					if len(payload) < 7 {
+						return
+					}
+					host = net.IP(payload[1:5]).String()
+					addrEnd = 5
+				case 0x03:
+					if len(payload) < 3 {
+						return
+					}
+					nameLen := int(payload[1])
+					if len(payload) < 2+nameLen+2 {
+						return
+					}
+					host = string(payload[2 : 2+nameLen])
+					addrEnd = 2 + nameLen
+				case 0x04:
+					if len(payload) < 19 {
+						return
+					}
+					host = net.IP(payload[1:17]).String()
+					addrEnd = 17
+				default:
+					return
 				}
-				nameLen := int(payload[1])
-				if len(payload) < 2+nameLen+2 {
-					continue
+				if len(payload) < addrEnd+2 {
+					return
 				}
-				host = string(payload[2 : 2+nameLen])
-				addrEnd = 2 + nameLen
-			case 0x04:
-				if len(payload) < 19 {
-					continue
+				port := binary.BigEndian.Uint16(payload[addrEnd : addrEnd+2])
+				data := payload[addrEnd+2:]
+
+				target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+				addr, ok := addrCache[target]
+				if !ok {
+					// Добавляем ограничение на размер кэша
+					if len(addrCache) > 1000 {
+						for k := range addrCache {
+							delete(addrCache, k)
+							break
+						}
+					}
+
+					var err error
+					addr, err = net.ResolveUDPAddr("udp", target)
+					if err != nil {
+						log.Printf("Vision UDP relay: resolve %s: %v", target, err)
+						return
+					}
+					addrCache[target] = addr
 				}
-				host = net.IP(payload[1:17]).String()
-				addrEnd = 17
-			default:
-				continue
-			}
-			if len(payload) < addrEnd+2 {
-				continue
-			}
-			port := binary.BigEndian.Uint16(payload[addrEnd : addrEnd+2])
-			data := payload[addrEnd+2:]
-			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-			addr, ok := addrCache[target]
-			if !ok {
-				var err error
-				addr, err = net.ResolveUDPAddr("udp", target)
-				if err != nil {
-					log.Printf("Vision UDP relay: resolve %s: %v", target, err)
-					continue
+				pc.SetWriteDeadline(time.Now().Add(30 * time.Second))
+				if _, err := pc.WriteTo(data, addr); err != nil {
+					log.Printf("Vision UDP relay: write to %s: %v", target, err)
 				}
-				addrCache[target] = addr
-			}
-			pc.SetWriteDeadline(time.Now().Add(30 * time.Second))
-			if _, err := pc.WriteTo(data, addr); err != nil {
-				log.Printf("Vision UDP relay: write to %s: %v", target, err)
-			}
+			}()
 		}
 	}()
 
-	buf := make([]byte, 65535)
-	frameBuf := make([]byte, 1+16+2+65535)
+	// Буферы для чтения из UDP сокета
+	bufPtr := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	// Буфер для сборки Vision-фрейма
+	frameBufPtr := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(frameBufPtr)
+	frameBuf := *frameBufPtr
+
 	for {
 		pc.SetReadDeadline(time.Now().Add(idleTimeout))
 		n, addr, err := pc.ReadFrom(buf)

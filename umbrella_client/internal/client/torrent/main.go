@@ -3,9 +3,12 @@ package torrent
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -20,15 +23,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/anacrolix/utp"
-	"github.com/hashicorp/yamux"
-	"github.com/miekg/dns"
-
+	"umbrella_client/internal/client/bypass"
 	"umbrella_client/internal/client/config"
 	"umbrella_client/internal/client/shaper"
 	"umbrella_client/internal/client/share"
-	"umbrella_client/internal/client/umbrella_dns"
-	"umbrella_client/internal/storage"
+
+	"github.com/anacrolix/utp"
+	"github.com/hashicorp/yamux"
 )
 
 const (
@@ -38,6 +39,8 @@ const (
 	pieceMsgID   = 7
 	unchokeMsgID = 1
 	interestedID = 2
+	bitfieldID   = 5
+	requestID    = 6
 )
 
 var (
@@ -46,8 +49,6 @@ var (
 	gAuthKey            []byte
 	gInfoHash           [20]byte
 	gBypass             []string
-	gDNSListen          string
-	gDNSUpstream        string
 	gShaper             bool
 	gSessionsNum        int
 	gConnectionsTimeOut time.Duration
@@ -58,20 +59,9 @@ var (
 	getSessionMu sync.Mutex
 )
 
-// Start initializes and runs the Torrent client module.
-func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
-	// Start pprof server for memory profiling
-	// go func() {
-	// 	log.Println("[INFO] Starting pprof server on localhost:6060")
-	// 	if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-	// 		log.Printf("[ERR] pprof server: %v", err)
-	// 	}
-	// }()
-
+func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 	cfg = c
 	gServerAddr = cfg.Server
-	gDNSListen = cfg.DNSListen
-	gDNSUpstream = cfg.DNSUpstream
 	gShaper = cfg.Shaper
 	gConnectionsTimeOut = time.Duration(cfg.Torrent.ConnectionsTimeOut) * time.Second
 	gBypass = make([]string, len(cfg.Bypass))
@@ -90,7 +80,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		return fmt.Errorf("invalid auth-key: must be 64 hex chars (32 bytes)")
 	}
 
-	// Prepare InfoHash
 	if cfg.Torrent.InfoHash != "" {
 		ih, err := hex.DecodeString(cfg.Torrent.InfoHash)
 		if err != nil || len(ih) != 20 {
@@ -98,27 +87,15 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}
 		copy(gInfoHash[:], ih)
 	} else {
-		// Generate random InfoHash if not provided
 		rand.Read(gInfoHash[:])
 		log.Printf("[INFO] Using random info-hash: %s", hex.EncodeToString(gInfoHash[:]))
 	}
 
-	// Standard bypasses
 	serverHost, _, err := net.SplitHostPort(gServerAddr)
 	if err != nil {
 		serverHost = gServerAddr
 	}
-	gBypass = append(gBypass, serverHost)
-	gBypass = append(gBypass,
-		"127.0.0.0/8",
-		"::1/128",
-		"10.0.0.0/8",
-		"172.16.0.0/12",
-		"192.168.0.0/16",
-		"169.254.0.0/16",
-		"fc00::/7",
-		"fe80::/10",
-	)
+	gBypass = append(gBypass, serverHost, "127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "fc00::/7", "fe80::/10")
 
 	if gShaper {
 		if cfg.PhasesData != nil {
@@ -132,18 +109,7 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			}
 			log.Printf("[INFO] Loaded %d phases from %s", len(shaper.Phases), cfg.PhasesFile)
 		}
-		go func() {
-			shaper.RunShaperEngine(ctx)
-		}()
-	}
-
-	// Start White Noise generator (Trackers Announce)
-	go startWhiteNoise(ctx)
-
-	if gDNSListen != "" {
-		go func() {
-			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
-		}()
+		go shaper.RunShaperEngine(ctx)
 	}
 
 	ln, err := net.Listen("tcp", cfg.ListenAddr)
@@ -166,17 +132,16 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			log.Printf("[ERR] SOCKS5 accept: %v", err)
 			continue
 		}
-		go handleSOCKS5(ctx, conn, dnsCache)
+		go handleSOCKS5(ctx, conn)
 	}
 }
 
-func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
+func handleSOCKS5(ctx context.Context, conn net.Conn) {
 	sCtx, sCancel := context.WithCancel(ctx)
 	defer sCancel()
 	defer conn.Close()
 
 	conn = &timeoutConn{Conn: conn}
-
 	cmd, host, port, err := share.Socks5Handshake(conn, cfg.UDPEnabled)
 	if err != nil {
 		log.Printf("[ERR] SOCKS5 handshake error from %s: %v", conn.RemoteAddr(), err)
@@ -184,45 +149,28 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	}
 
 	if cmd == 0x03 {
-		handleSocks5UDP(ctx, conn, dnsCache)
+		handleSocks5UDP(ctx, conn)
 		return
 	}
 
-	// Bypass logic
-	var domainFromIp string
-	if c, ok := dnsCache.Load(host); ok {
-		domainFromIp = c.(string)
-		log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-	}
-
-	var isShouldBypass bool
-	if len(domainFromIp) > 0 {
-		isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-	} else {
-		isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-	}
-
-	if isShouldBypass {
+	if bypass.ShouldBypass(host, gBypass) {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		share.HandleDirect(sCtx, conn, host, port)
 		return
 	}
 
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	log.Printf("[INFO] Tunneling %s → %s", conn.RemoteAddr(), target)
 
 	var rawStream net.Conn
 	var sErr error
-
 	for attempt := 0; attempt < 3; attempt++ {
 		sess, err := getSession(sCtx)
 		if err != nil {
 			log.Printf("[ERR] failed to get session: %v", err)
 			return
 		}
-
 		rawStream, sErr = sess.Open()
 		if sErr == nil {
 			targetBytes := []byte(target)
@@ -241,11 +189,9 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	if sErr != nil || rawStream == nil {
 		return
 	}
-
 	stream := &timeoutConn{Conn: rawStream}
 	defer stream.Close()
 
-	// Relay data with half-close support
 	go func() {
 		b := share.CopyBufPool.Get().(*[]byte)
 		defer share.CopyBufPool.Put(b)
@@ -271,56 +217,7 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	<-sCtx.Done()
 }
 
-type timeoutConn struct {
-	net.Conn
-}
-
-func (ts *timeoutConn) CloseWrite() error {
-	type halfCloser interface{ CloseWrite() error }
-	if hc, ok := ts.Conn.(halfCloser); ok {
-		return hc.CloseWrite()
-	}
-	return nil
-}
-
-func (ts *timeoutConn) Read(p []byte) (n int, err error) {
-	if gConnectionsTimeOut > 0 {
-		ts.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	n, err = ts.Conn.Read(p)
-	return
-}
-
-func (ts *timeoutConn) Write(p []byte) (n int, err error) {
-	if gConnectionsTimeOut > 0 {
-		ts.Conn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	n, err = ts.Conn.Write(p)
-	return
-}
-
-type timeoutPacketConn struct {
-	net.PacketConn
-}
-
-func (ts *timeoutPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	if gConnectionsTimeOut > 0 {
-		ts.PacketConn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	n, addr, err = ts.PacketConn.ReadFrom(p)
-	return
-}
-
-func (ts *timeoutPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
-	if gConnectionsTimeOut > 0 {
-		ts.PacketConn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
-	}
-	n, err = ts.PacketConn.WriteTo(p, addr)
-	return
-}
-
-func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage.DnsCache) {
-	// Create local UDP socket for SOCKS5 app
+func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn) {
 	rawUdpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		rawTcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -328,8 +225,6 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 		return
 	}
 	udpConn := &timeoutPacketConn{PacketConn: rawUdpConn}
-
-	// Жизненный цикл UDP релея
 	udpCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	defer udpConn.Close()
@@ -342,8 +237,6 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 
 	var addrMu sync.Mutex
 	var appAddr net.Addr
-
-	// Get a session and open a stream for UDP relay
 	var rawStream net.Conn
 	for attempt := 0; attempt < 3; attempt++ {
 		sess, err := getSession(udpCtx)
@@ -351,7 +244,6 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 			log.Printf("[ERR] failed to get session for UDP: %v", err)
 			return
 		}
-
 		s, err := sess.Open()
 		if err == nil {
 			targetBytes := []byte("UDP_RELAY")
@@ -367,12 +259,10 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 			dropSession(sess)
 		}
 	}
-
 	if rawStream == nil {
 		log.Printf("[ERR] failed to establish UDP stream after retries")
 		return
 	}
-
 	stream := &timeoutConn{Conn: rawStream}
 	defer stream.Close()
 
@@ -391,7 +281,6 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 		bufPtr := share.UDPBufPool.Get().(*[]byte)
 		defer share.UDPBufPool.Put(bufPtr)
 		buf := *bufPtr
-
 		frameBufPtr := share.UDPBufPool.Get().(*[]byte)
 		defer share.UDPBufPool.Put(frameBufPtr)
 		frameBuf := *frameBufPtr
@@ -401,7 +290,6 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 			if err != nil {
 				return
 			}
-
 			addrMu.Lock()
 			if appAddr == nil {
 				appAddr = addr
@@ -441,18 +329,7 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 				continue
 			}
 
-			var domainFromIp string
-			if c, ok := dnsCache.Load(host); ok {
-				domainFromIp = c.(string)
-				log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-			}
-
-			var isShouldBypass bool
-			if len(domainFromIp) > 0 {
-				isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-			} else {
-				isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-			}
+			isShouldBypass := bypass.ShouldBypass(host, gBypass)
 
 			if isShouldBypass {
 				targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
@@ -462,37 +339,29 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 				continue
 			}
 
-			// Tunnel
 			payload := buf[3:n]
 			binary.BigEndian.PutUint32(frameBuf[:4], uint32(len(payload)))
 			copy(frameBuf[4:], payload)
-			if _, err := relayWriter.Write(frameBuf[:4+len(payload)]); err != nil {
-				return
-			}
+			relayWriter.Write(frameBuf[:4+len(payload)])
 		}
 	}()
 
-	// Server -> App
 	go func() {
 		defer cancel()
 		lenBuf := make([]byte, 4)
 		pktBufPtr := share.UDPBufPool.Get().(*[]byte)
 		defer share.UDPBufPool.Put(pktBufPtr)
 		pktBuf := *pktBufPtr
-		pktBuf[0] = 0x00
-		pktBuf[1] = 0x00
-		pktBuf[2] = 0x00
+		pktBuf[0], pktBuf[1], pktBuf[2] = 0, 0, 0
 		for {
 			if _, err := io.ReadFull(relayReader, lenBuf); err != nil {
 				return
 			}
-
 			payloadLen := binary.BigEndian.Uint32(lenBuf)
 			if payloadLen > 65535 {
 				return
 			}
-			payload := pktBuf[3 : 3+payloadLen]
-			if _, err := io.ReadFull(relayReader, payload); err != nil {
+			if _, err := io.ReadFull(relayReader, pktBuf[3:3+payloadLen]); err != nil {
 				return
 			}
 			addrMu.Lock()
@@ -503,59 +372,20 @@ func handleSocks5UDP(ctx context.Context, rawTcpConn net.Conn, dnsCache *storage
 			}
 		}
 	}()
-
-	// Ждем закрытия контекста или TCP соединения
 	<-udpCtx.Done()
-}
-
-func parseSOCKS5UDPAddr(buf []byte) (host string, port uint16, dataStart int, err error) {
-	if len(buf) < 4 {
-		return "", 0, 0, fmt.Errorf("packet too short")
-	}
-	atyp := buf[3]
-	switch atyp {
-	case 0x01: // IPv4
-		if len(buf) < 10 {
-			return "", 0, 0, fmt.Errorf("short IPv4 packet")
-		}
-		host = net.IP(buf[4:8]).String()
-		port = binary.BigEndian.Uint16(buf[8:10])
-		dataStart = 10
-	case 0x03: // Domain
-		hostLen := int(buf[4])
-		if len(buf) < 5+hostLen+2 {
-			return "", 0, 0, fmt.Errorf("short domain packet")
-		}
-		host = string(buf[5 : 5+hostLen])
-		port = binary.BigEndian.Uint16(buf[5+hostLen : 5+hostLen+2])
-		dataStart = 5 + hostLen + 2
-	case 0x04: // IPv6
-		if len(buf) < 22 {
-			return "", 0, 0, fmt.Errorf("short IPv6 packet")
-		}
-		host = net.IP(buf[4:20]).String()
-		port = binary.BigEndian.Uint16(buf[20:22])
-		dataStart = 22
-	default:
-		return "", 0, 0, fmt.Errorf("unknown address type %d", atyp)
-	}
-	return host, port, dataStart, nil
 }
 
 func getSession(ctx context.Context) (*yamux.Session, error) {
 	getSessionMu.Lock()
 	defer getSessionMu.Unlock()
-
 	idx := mrand.Intn(gSessionsNum)
 	if sessions[idx] != nil && !sessions[idx].IsClosed() {
 		return sessions[idx], nil
 	}
-
 	sess, err := establishSession(ctx, idx)
 	if err == nil {
 		return sess, nil
 	}
-
 	for i := 0; i < gSessionsNum; i++ {
 		if sessions[i] != nil && !sessions[i].IsClosed() {
 			return sessions[i], nil
@@ -568,7 +398,6 @@ func getSession(ctx context.Context) (*yamux.Session, error) {
 func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	sessMu[idx].Lock()
 	defer sessMu[idx].Unlock()
-
 	if sessions[idx] != nil && !sessions[idx].IsClosed() {
 		return sessions[idx], nil
 	}
@@ -582,22 +411,19 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	var targetAddr string
 	if strings.Contains(portStr, "-") {
 		parts := strings.Split(portStr, "-")
-		startPort, _ := strconv.Atoi(parts[0])
-		endPort, _ := strconv.Atoi(parts[1])
-		randomPort := startPort + mrand.Intn(endPort-startPort+1)
-		targetAddr = net.JoinHostPort(host, strconv.Itoa(randomPort))
+		start, _ := strconv.Atoi(parts[0])
+		end, _ := strconv.Atoi(parts[1])
+		targetAddr = net.JoinHostPort(host, strconv.Itoa(start+mrand.Intn(end-start+1)))
 	} else {
 		targetAddr = gServerAddr
 	}
 
-	// 1. Create uTP connection
 	s, err := utp.Dial(targetAddr)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Send BitTorrent Handshake with HMAC
-	peerID := generatePeerID()
+	peerID, nonce := generatePeerID()
 	handshake := make([]byte, handshakeLen)
 	handshake[0] = pstrlen
 	copy(handshake[1:20], pstr)
@@ -616,38 +442,30 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		s.Close()
 		return nil, err
 	}
-	s.SetReadDeadline(time.Time{}) // Reset deadline
+	s.SetReadDeadline(time.Time{})
 
-	// 4. Send "Interested" and "Unchoke"
 	s.Write([]byte{0, 0, 0, 1, interestedID})
 	s.Write([]byte{0, 0, 0, 1, unchokeMsgID})
 
-	// 5. Setup yamux
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
 	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.LogOutput = io.Discard
 
-	sess, err := yamux.Client(NewTorrentConn(s), muxCfg)
+	sess, err := yamux.Client(NewTorrentConn(s, gAuthKey, gInfoHash, nonce), muxCfg)
 	if err != nil {
 		s.Close()
 		return nil, err
 	}
-
-	go func() {
-		scheduleReconnect(ctx, sess)
-	}()
-
+	go scheduleReconnect(ctx, sess)
 	sessions[idx] = sess
 	return sess, nil
 }
 
 func scheduleReconnect(ctx context.Context, s *yamux.Session) {
-	// Random delay in [3, 15) minutes using crypto/rand for unpredictability.
-	const minDelay = 3 * time.Minute
-	const maxJitter = 12 * time.Minute
-
+	const minDelay = 30 * time.Minute
+	const maxJitter = 30 * time.Minute
 	delay := minDelay
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxJitter)))
 	if err == nil {
@@ -688,139 +506,43 @@ func dropSession(s *yamux.Session) {
 	}
 }
 
-func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
-	dnsData, err := r.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("pack dns: %w", err)
-	}
-
-	host, portStr, _ := net.SplitHostPort(gDNSUpstream)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
-
-	var addrBytes []byte
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
-		} else {
-			addrBytes = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		addrBytes = append([]byte{0x03, byte(len(host))}, []byte(host)...)
-	}
-	var portBytes [2]byte
-	binary.BigEndian.PutUint16(portBytes[:], port)
-
-	payload := append(addrBytes, portBytes[:]...)
-	payload = append(payload, dnsData...)
-
-	// Get a session and open a stream for DNS
-	var respPayload []byte
-	for attempt := 0; attempt < 3; attempt++ {
-		sess, err := getSession(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		stream, err := sess.Open()
-		if err != nil {
-			dropSession(sess)
-			continue
-		}
-
-		stream = &timeoutConn{Conn: stream}
-
-		// Use a helper function to ensure stream is closed properly in each attempt
-		respPayload, err = func() ([]byte, error) {
-			defer stream.Close()
-
-			// Send special "DNS_QUERY" target
-			targetBytes := []byte("DNS_QUERY")
-			lenBuf := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenBuf, uint32(len(targetBytes)))
-			if _, err := stream.Write(lenBuf); err != nil {
-				return nil, err
-			}
-			if _, err := stream.Write(targetBytes); err != nil {
-				return nil, err
-			}
-
-			var relayWriter io.Writer = stream
-			var relayReader io.Reader = stream
-			if gShaper {
-				relayWriter = &shaper.ShapedWriter{W: stream, Bucket: &shaper.GUpBucket}
-				relayReader = &shaper.ShapedReader{R: stream, Bucket: &shaper.GDownBucket}
-			}
-
-			// Send DNS query
-			binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-			if _, err := relayWriter.Write(lenBuf); err != nil {
-				return nil, err
-			}
-			if _, err := relayWriter.Write(payload); err != nil {
-				return nil, err
-			}
-
-			// Read DNS response
-			if _, err := io.ReadFull(relayReader, lenBuf); err != nil {
-				return nil, err
-			}
-			respLen := binary.BigEndian.Uint32(lenBuf)
-			if respLen > 65535 {
-				return nil, fmt.Errorf("dns response too large: %d", respLen)
-			}
-			data := make([]byte, respLen)
-			if _, err := io.ReadFull(relayReader, data); err != nil {
-				return nil, err
-			}
-			return data, nil
-		}()
-
-		if err == nil {
-			break
-		}
-		log.Printf("[ERR] DNS attempt %d failed: %v", attempt+1, err)
-	}
-
-	if respPayload == nil {
-		return nil, fmt.Errorf("failed to forward DNS after retries")
-	}
-
-	off := 0
-	if len(respPayload) > 0 {
-		switch respPayload[0] {
-		case 0x01:
-			off = 1 + 4 + 2
-		case 0x04:
-			off = 1 + 16 + 2
-		case 0x03:
-			if len(respPayload) > 1 {
-				off = 1 + 1 + int(respPayload[1]) + 2
-			}
-		}
-	}
-
-	msg := new(dns.Msg)
-	if err := msg.Unpack(respPayload[off:]); err != nil {
-		return nil, fmt.Errorf("unpack dns response: %w", err)
-	}
-
-	return msg, nil
-}
-
-func generatePeerID() [20]byte {
+func generatePeerID() ([20]byte, []byte) {
 	var pid [20]byte
 	copy(pid[:8], []byte("-TR4000-"))
-	nonce := make([]byte, 4)
-	rand.Read(nonce)
-	copy(pid[8:12], nonce)
+
+	// 1. Генерируем 5 случайных байт (как в вашем TLS примере)
+	// Но так как места мало, возьмем 4 байта
+	rnd := make([]byte, 4)
+	rand.Read(rnd)
+
+	// 2. Получаем минуты с начала года (3 байта)
+	now := time.Now().UTC()
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	minutes := uint32(now.Sub(yearStart).Minutes())
+	minBytes := make([]byte, 3)
+	minBytes[0] = byte(minutes >> 16)
+	minBytes[1] = byte(minutes >> 8)
+	minBytes[2] = byte(minutes)
+
+	// 3. Зашумляем время через XOR с частью rnd
+	maskedTime := make([]byte, 3)
+	for i := 0; i < 3; i++ {
+		maskedTime[i] = minBytes[i] ^ rnd[i]
+	}
+
+	// Собираем: [Prefix:8][Rnd:4][MaskedTime:3][HMAC:5]
+	copy(pid[8:12], rnd)
+	copy(pid[12:15], maskedTime)
+
+	// 4. Подпись HMAC от Rnd + Real Minutes + InfoHash
 	mac := hmac.New(sha1.New, gAuthKey)
-	mac.Write(nonce)
+	mac.Write(rnd)
+	mac.Write(minBytes)
 	mac.Write(gInfoHash[:])
-	sig := mac.Sum(nil)[:8]
-	copy(pid[12:20], sig)
-	return pid
+	sig := mac.Sum(nil)[:5]
+	copy(pid[15:20], sig)
+
+	return pid, rnd // Возвращаем rnd как nonce для AES
 }
 
 type TorrentConn struct {
@@ -831,31 +553,42 @@ type TorrentConn struct {
 	remainingPadding int
 	flushTimer       *time.Timer
 	mu               sync.Mutex
+	enc              cipher.Stream
+	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
 	}
+
+	// Initialize AES-CTR for light payload encryption
+	// Key = SHA256(AuthKey)
+	// IV = SHA256(nonce + InfoHash)[:16]
+	key := sha256.Sum256(authKey)
+	ivSeed := append(nonce, infoHash[:]...)
+	iv := sha256.Sum256(ivSeed)
+
+	block, err := aes.NewCipher(key[:])
+	if err == nil {
+		tc.enc = cipher.NewCTR(block, iv[:16])
+		tc.dec = cipher.NewCTR(block, iv[16:32]) // Use second half of SHA256 for symmetry
+	}
+
 	// Оборачиваем запись в буфер для снижения оверхеда паддинга
 	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
 	return tc
 }
 
-type rawPieceWriter struct {
-	tc *TorrentConn
-}
+type rawPieceWriter struct{ tc *TorrentConn }
 
-func (w *rawPieceWriter) Write(p []byte) (int, error) {
-	return w.tc.writePiece(p)
-}
+func (w *rawPieceWriter) Write(p []byte) (int, error) { return w.tc.writePiece(p) }
 
 func (c *TorrentConn) Read(p []byte) (n int, err error) {
 	if c.reader == nil {
 		c.reader = bufio.NewReaderSize(c.Conn, 256*1024)
 	}
-
 	for {
 		if c.remainingPayload > 0 {
 			toRead := c.remainingPayload
@@ -866,24 +599,23 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			if err != nil {
 				return n, err
 			}
+			if c.dec != nil {
+				c.dec.XORKeyStream(p[:n], p[:n])
+			}
 			c.remainingPayload -= n
 			return n, nil
 		}
-
-		// Если полезная нагрузка считана, но остался паддинг — сбрасываем его
 		if c.remainingPadding > 0 {
 			if _, err := c.reader.Discard(c.remainingPadding); err != nil {
 				return 0, err
 			}
 			c.remainingPadding = 0
 		}
-
-		var header [4]byte
-		// Читаем длину (4 байта)
-		if _, err := io.ReadFull(c.reader, header[:]); err != nil {
+		var h [4]byte
+		if _, err := io.ReadFull(c.reader, h[:]); err != nil {
 			return 0, err
 		}
-		length := binary.BigEndian.Uint32(header[:])
+		length := binary.BigEndian.Uint32(h[:])
 		if length == 0 {
 			continue
 		}
@@ -917,7 +649,6 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			c.remainingPadding = totalInPiece - pLen
 
 			if c.remainingPayload == 0 {
-				// Если пакет пустой (только паддинг), продолжаем цикл
 				continue
 			}
 		} else {
@@ -932,10 +663,7 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 func (c *TorrentConn) Write(p []byte) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
 	n, err = c.writer.Write(p)
-
-	// Сбрасываем/запускаем таймер авто-флаша для минимизации задержек
 	if c.flushTimer != nil {
 		c.flushTimer.Stop()
 	}
@@ -944,16 +672,13 @@ func (c *TorrentConn) Write(p []byte) (n int, err error) {
 		c.writer.Flush()
 		c.mu.Unlock()
 	})
-
 	return n, err
 }
 
-// Внутренний метод записи уже сформированного торрент-пакета
 func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	const bittorrentHeadLen = 9
 	const internalHeadLen = 2
 	padLen := mrand.Intn(256)
-
 	bufPtr := share.UDPBufPool.Get().(*[]byte)
 	defer share.UDPBufPool.Put(bufPtr)
 	buf := *bufPtr
@@ -961,110 +686,79 @@ func (c *TorrentConn) writePiece(p []byte) (n int, err error) {
 	totalMsgLen := bittorrentHeadLen + internalHeadLen + len(p) + padLen
 	binary.BigEndian.PutUint32(buf[0:4], uint32(totalMsgLen))
 	buf[4] = pieceMsgID
-	binary.BigEndian.PutUint32(buf[5:9], 0)
-	binary.BigEndian.PutUint32(buf[9:13], 0)
+	binary.BigEndian.PutUint32(buf[5:9], uint32(mrand.Int31n(1000)))
+	binary.BigEndian.PutUint32(buf[9:13], uint32(mrand.Int31n(131072)))
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(p)))
-	copy(buf[15:], p)
-
+	if c.enc != nil {
+		c.enc.XORKeyStream(buf[15:15+len(p)], p)
+	} else {
+		copy(buf[15:], p)
+	}
 	if padLen > 0 {
 		rand.Read(buf[15+len(p) : 15+len(p)+padLen])
 	}
-
 	_, err = c.Conn.Write(buf[:4+totalMsgLen])
 	return len(p), err
 }
 
-func startWhiteNoise(ctx context.Context) {
-	trackers := []string{
-		"udp://tracker.opentrackr.org:1337/announce",
-		"udp://tracker.openbittorrent.com:6969/announce",
-		"udp://9.rarbg.com:2810/announce",
-		"udp://exodus.desync.com:6969/announce",
-		"udp://open.stealth.si:80/announce",
+func parseSOCKS5UDPAddr(buf []byte) (host string, port uint16, dataStart int, err error) {
+	if len(buf) < 4 {
+		return "", 0, 0, fmt.Errorf("short")
 	}
-
-	peerID := generatePeerID()
-
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-
-	// Сразу сделаем первый анонс
-	go announceToAll(trackers, gInfoHash, peerID)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			go announceToAll(trackers, gInfoHash, peerID)
-		}
+	atyp := buf[3]
+	switch atyp {
+	case 0x01:
+		host = net.IP(buf[4:8]).String()
+		port = binary.BigEndian.Uint16(buf[8:10])
+		dataStart = 10
+	case 0x03:
+		l := int(buf[4])
+		host = string(buf[5 : 5+l])
+		port = binary.BigEndian.Uint16(buf[5+l : 5+l+2])
+		dataStart = 5 + l + 2
+	case 0x04:
+		host = net.IP(buf[4:20]).String()
+		port = binary.BigEndian.Uint16(buf[20:22])
+		dataStart = 22
 	}
+	return host, port, dataStart, nil
 }
 
-func announceToAll(trackers []string, infoHash, peerID [20]byte) {
-	for _, tr := range trackers {
-		go func(urlStr string) {
-			if err := announceToTracker(urlStr, infoHash, peerID); err != nil {
-				// log.Printf("[DEBUG] WhiteNoise: announce to %s failed: %v", urlStr, err)
-			} else {
-				log.Printf("[INFO] WhiteNoise: Announced to tracker %s", urlStr)
-			}
-		}(tr)
+type timeoutConn struct{ net.Conn }
+
+func (ts *timeoutConn) Read(p []byte) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.Conn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
 	}
+	return ts.Conn.Read(p)
 }
 
-func announceToTracker(urlStr string, infoHash, peerID [20]byte) error {
-	u, err := net.ResolveUDPAddr("udp", strings.TrimPrefix(urlStr, "udp://"))
-	if err != nil {
-		return err
+func (ts *timeoutConn) Write(p []byte) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.Conn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
 	}
+	return ts.Conn.Write(p)
+}
 
-	conn, err := net.DialUDP("udp", nil, u)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	// 1. Connection request
-	transactionID := uint32(mrand.Int31())
-	req := make([]byte, 16)
-	binary.BigEndian.PutUint64(req[0:8], 0x41727101980) // protocol_id
-	binary.BigEndian.PutUint32(req[8:12], 0)            // action: connect
-	binary.BigEndian.PutUint32(req[12:16], transactionID)
-
-	if _, err := conn.Write(req); err != nil {
-		return err
-	}
-
-	resp := make([]byte, 16)
-	if _, err := io.ReadFull(conn, resp); err != nil {
-		return err
-	}
-
-	if binary.BigEndian.Uint32(resp[0:4]) != 0 || binary.BigEndian.Uint32(resp[4:8]) != transactionID {
-		return fmt.Errorf("invalid connect response")
-	}
-	connectionID := binary.BigEndian.Uint64(resp[8:16])
-
-	// 2. Announce request
-	ann := make([]byte, 98)
-	binary.BigEndian.PutUint64(ann[0:8], connectionID)
-	binary.BigEndian.PutUint32(ann[8:12], 1) // action: announce
-	binary.BigEndian.PutUint32(ann[12:16], transactionID)
-	copy(ann[16:36], infoHash[:])
-	copy(ann[36:56], peerID[:])
-	binary.BigEndian.PutUint64(ann[56:64], 0)          // downloaded
-	binary.BigEndian.PutUint64(ann[64:72], 0)          // left (fake)
-	binary.BigEndian.PutUint64(ann[72:80], 0)          // uploaded
-	binary.BigEndian.PutUint32(ann[80:84], 0)          // event: none
-	binary.BigEndian.PutUint32(ann[84:88], 0)          // IP
-	binary.BigEndian.PutUint32(ann[88:92], 0)          // key
-	binary.BigEndian.PutUint32(ann[92:96], 0xFFFFFFFF) // num_want: -1 means default
-	binary.BigEndian.PutUint16(ann[96:98], 6881)       // port
-
-	if _, err := conn.Write(ann); err != nil {
-		return err
+func (ts *timeoutConn) CloseWrite() error {
+	if hc, ok := ts.Conn.(interface{ CloseWrite() error }); ok {
+		return hc.CloseWrite()
 	}
 	return nil
+}
+
+type timeoutPacketConn struct{ net.PacketConn }
+
+func (ts *timeoutPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.PacketConn.SetReadDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	return ts.PacketConn.ReadFrom(p)
+}
+
+func (ts *timeoutPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if gConnectionsTimeOut > 0 {
+		ts.PacketConn.SetWriteDeadline(time.Now().Add(gConnectionsTimeOut))
+	}
+	return ts.PacketConn.WriteTo(p, addr)
 }

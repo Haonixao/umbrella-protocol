@@ -24,7 +24,7 @@ const (
 
 func main() {
 	// Адрес сервера Umbrella (Torrent порт)
-	serverAddrStr := "138.124.240.89:50000"
+	serverAddrStr := "0.0.0.0:40500"
 	timeout := 10 * time.Second
 
 	// 1. Устанавливаем uTP соединение

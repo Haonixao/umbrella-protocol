@@ -1,4 +1,4 @@
-module torrent_probe
+module torrent_test
 
 go 1.25.6
 

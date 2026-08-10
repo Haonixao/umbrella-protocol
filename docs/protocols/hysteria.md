@@ -1,55 +1,52 @@
-# 🏎️ Hysteria 2 (Umbrella Edition)
+# Hysteria 2 (Umbrella Variant)
 
-Hysteria 2 — это высокопроизводительный протокол на базе QUIC (UDP), оптимизированный для работы в сетях с высокими потерями пакетов и нестабильной задержкой.
+Hysteria 2 is a high-performance protocol based on QUIC (UDP), optimized for operation in networks with high packet loss and unstable latency.
 
-## Конфигурация
+## Configuration
 
-Для активации этого режима используйте `protocol: hysteria` в конфигурационных файлах.
+To activate this mode, use `protocol: hysteria` in the configuration files.
 
-### Сервер (config.yaml)
+### Server (config.yaml)
+
 ```yaml
 protocol: "hysteria"
-port: "443"             # Основной порт (маскарад)
-dest: "samsung.com:443" # Fallback сайт для "чужих"
+port: "443"             # Main port (masquerade)
+dest: "samsung.com:443" # Fallback site for "outsiders"
 
 hysteria:
-  quic-port: "8443"     # Внутренний порт для Hysteria ядра
-  auth-key: "..."      # HMAC ключ для аутентификации (hex, 32 байта)
-  auth-password: "..." # Пароль для QUIC-аутентификации
+  auth-key: "..."      # HMAC key for authentication (hex, 32 bytes)
+  auth-password: "..." # Password for QUIC authentication
 ```
 
-### Клиент (config.yaml)
+### Client (config.yaml)
+
 ```yaml
 protocol: "hysteria"
 server: "your_vps_ip:443"
 sni: "samsung.com"
 listen: "0.0.0.0:1080"
-udp: true
 
 hysteria:
-  auth-key: "..."      # Должен совпадать с сервером
-  auth-password: "..." # Должен совпадать с сервером
-  conns-num: 5          # Количество параллельных UDP соединений
+  auth-key: "..."      # Must match the server
+  auth-password: "..." # Must match the server
 ```
 
-## Особенности реализации в Umbrella
+## Implementation Features in Umbrella
 
-В отличие от классической Hysteria, реализация в Umbrella Protocol включает кастомную надстройку (Flawless Masquerade) и Random padding на уровне пакетов для обеспечения максимальной скрытности (**из-за этого не поддерживается режим Salamander**):
+Unlike classic Hysteria, the Umbrella Protocol implementation includes a custom enhancement (Flawless Masquerade) and packet-level Random padding to ensure maximum stealth ( **due to this, Salamander mode is not supported** ):
 
-### 1. Двухуровневая аутентификация и маскарад (Flawless Masquerade)
-Umbrella реализует уникальный механизм проверки клиентов еще до начала QUIC-рукопожатия:
-*   **HMAC Connection ID**: Клиент встраивает HMAC-подпись в `Source Connection ID` первого пакета (`Initial`). Сервер проверяет эту подпись, используя `auth-key`.
-*   **Прозрачное проксирование (Fallback)**: Если подпись невалидна или отсутствует (запрос от сканера или "чужого"), сервер ведет себя как прозрачный UDP-прокси. Он перенаправляет трафик на `dest` (например, `samsung.com`), полностью имитируя поведение легитимного сервиса.
-*   **Защита от Active Probing**: Провайдер или цензор не могут обнаружить Hysteria простым сканированием, так как сервер отвечает только своим клиентам. Для "чужих" выполняется прозрачное проксирование QUIC соединения на `dest`.
+### 1. Two-level Authentication and Masquerade (Flawless Masquerade)
+
+Umbrella implements a unique mechanism for verifying clients even before the QUIC handshake begins:
+* **HMAC Connection ID** : The client embeds an HMAC signature into the `Source Connection ID` of the first packet (`Initial`). The server verifies this signature using the `auth-key`.
+* **Transparent Proxying (Fallback)** : If the signature is invalid or missing (a request from a scanner or an "outsider"), the server behaves as a transparent UDP proxy. It redirects traffic to `dest` (e.g., samsung.com), fully imitating the behavior of a legitimate service.
+* **Active Probing Protection** : The ISP or censor cannot detect Hysteria by simple scanning, as the server only responds to its own clients. For "outsiders" transparent proxying of the QUIC connection to `dest` is performed.
 
 ### 3. Padding
-*   **Random Padding:** В каждое сообщение добавляется от 0 до 255 байт случайного мусора.
-*   Это делает длину каждого пакета уникальной и непредсказуемой, ломая любые статистические сигнатуры длин пакетов.
 
-### 4. Динамическая ротация
-Система автоматически ротирует UDP-клиентов в пуле, генерируя новые Connection ID с уникальными HMAC-подписями для каждой новой сессии. Это предотвращает возможность отслеживания пользователя по статическим сетевым идентификаторам.
+* **Random Padding:** Between 0 and 255 bytes of random "junk" are added to each message.
+*   This makes the length of every packet unique and unpredictable, breaking any statistical packet length signatures.
 
-## Когда использовать?
-*   Для просмотра 4K видео (YouTube, Netflix).
-*   Для онлайн-игр (минимальный джиттер и задержки).
-*   Если ваш провайдер не блокирует UDP-трафик.
+### 4. Dynamic Rotation
+
+The system automatically rotates UDP clients in the pool, generating new Connection IDs with unique HMAC signatures for each new session. This prevents tracking users via static network identifiers.

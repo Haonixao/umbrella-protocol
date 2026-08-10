@@ -1,4 +1,4 @@
-module hysteria_mode
+module quic_test
 
 go 1.25.6
 

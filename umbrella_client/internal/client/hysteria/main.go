@@ -10,20 +10,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
+	mrand "math/rand"
 	"net"
 	"strconv"
 	"sync"
 	"time"
 
-	"github.com/apernet/hysteria/core/v2/client"
-	"github.com/apernet/quic-go"
-	"github.com/miekg/dns"
-
+	"umbrella_client/internal/client/bypass"
 	"umbrella_client/internal/client/config"
 	"umbrella_client/internal/client/shaper"
 	"umbrella_client/internal/client/share"
-	"umbrella_client/internal/client/umbrella_dns"
-	"umbrella_client/internal/storage"
+
+	"github.com/apernet/hysteria/core/v2/client"
+	"github.com/apernet/quic-go"
 )
 
 type customCIDGenerator struct {
@@ -31,18 +31,38 @@ type customCIDGenerator struct {
 }
 
 func (g *customCIDGenerator) GenerateConnectionID() (quic.ConnectionID, error) {
-	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
+	rnd := make([]byte, 5)
+	if _, err := rand.Read(rnd); err != nil {
 		return quic.ConnectionID{}, err
 	}
 
-	mac := hmac.New(sha512.New, g.authKey)
-	mac.Write(nonce)
-	signature := mac.Sum(nil)[:8]
+	// Получаем минуты с начала года
+	now := time.Now().UTC()
+	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+	minutes := uint32(now.Sub(yearStart).Minutes())
 
+	minBytes := make([]byte, 3)
+	minBytes[0] = byte(minutes >> 16)
+	minBytes[1] = byte(minutes >> 8)
+	minBytes[2] = byte(minutes)
+
+	// Зашумляем время через XOR с rnd
+	maskedTime := make([]byte, 3)
+	for i := 0; i < 3; i++ {
+		maskedTime[i] = minBytes[i] ^ rnd[i]
+	}
+
+	// HMAC от Rnd + Real Minutes
+	mac := hmac.New(sha512.New, g.authKey)
+	mac.Write(rnd)
+	mac.Write(minBytes)
+	signature := mac.Sum(nil)[:12] // 12 байт подписи
+
+	// Собираем CID: [Rnd:5][MaskedTime:3][Signature:12] = 20 байт
 	cid := make([]byte, 20)
-	copy(cid[:12], nonce)
-	copy(cid[12:], signature)
+	copy(cid[0:5], rnd)
+	copy(cid[5:8], maskedTime)
+	copy(cid[8:20], signature)
 
 	return quic.ConnectionIDFromBytes(cid), nil
 }
@@ -55,8 +75,6 @@ func (g *customCIDGenerator) ConnectionIDLen() int {
 var (
 	cfg              *config.Config
 	gServerAddr      string
-	gDNSListen       string
-	gDNSUpstream     string
 	gAuthKey         []byte
 	gListenAddr      string
 	gBypass          []string
@@ -66,7 +84,6 @@ var (
 	tcpSessionsMu    sync.Mutex
 	clientPool       []client.Client
 	clientPoolMu     sync.Mutex
-	poolIdx          int
 )
 
 type tcpSession struct {
@@ -78,12 +95,10 @@ type hyUdpSession struct {
 	lastActive time.Time
 }
 
-func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
+func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 	cfg = c
 	gServerAddr = cfg.Server
 	gListenAddr = cfg.ListenAddr
-	gDNSListen = cfg.DNSListen
-	gDNSUpstream = cfg.DNSUpstream
 	hyClientPoolSize = cfg.Hysteria.ConnsNum
 	gBypass = make([]string, len(cfg.Bypass))
 	copy(gBypass, cfg.Bypass)
@@ -103,7 +118,8 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		gBypass = append(gBypass, gServerAddr)
 	}
 
-	gBypass = append(gBypass,
+	gBypass = append(
+		gBypass,
 		"127.0.0.0/8",
 		"::1/128",
 		"10.0.0.0/8",
@@ -129,12 +145,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 		}
 		go func() {
 			shaper.RunShaperEngine(ctx)
-		}()
-	}
-
-	if gDNSListen != "" {
-		go func() {
-			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
 		}()
 	}
 
@@ -181,14 +191,14 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string, dnsCache *
 			log.Printf("[ERR] SOCKS5 accept: %v", err)
 			continue
 		}
-		go handleSOCKS5(ctx, conn, dnsCache)
+		go handleSOCKS5(ctx, conn)
 	}
 }
 
-func listenSOCKS5(ctx context.Context, dnsCache *storage.DnsCache) {
+func listenSOCKS5(ctx context.Context) {
 }
 
-func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
+func handleSOCKS5(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
 	cmd, host, port, err := share.Socks5Handshake(conn, cfg.UDPEnabled)
@@ -197,26 +207,15 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		return
 	}
 
-	// Try DNS cache
-	var domainFromIp string
-	if c, ok := dnsCache.Load(host); ok {
-		domainFromIp = c.(string)
-		log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-	}
-
 	if cmd == 0x03 {
-		if err := handleSocks5UDP(ctx, conn, dnsCache); err != nil {
+		if err := handleSocks5UDP(ctx, conn); err != nil {
 			log.Printf("[ERR] SOCKS5 UDP ASSOCIATE failed: %v", err)
 		}
 		return
 	}
 
 	var isShouldBypass bool
-	if len(domainFromIp) > 0 {
-		isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-	} else {
-		isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-	}
+	isShouldBypass = bypass.ShouldBypass(host, gBypass)
 
 	if isShouldBypass {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
@@ -230,7 +229,7 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 
 	log.Printf("[INFO] Tunneling %s → %s", conn.RemoteAddr(), target)
 
-	hyConn, err := dialTCP(target)
+	hyConn, err := dialTCP(target, ctx)
 	if err != nil {
 		log.Printf("[ERR] dial to %s → %v", target, err)
 		return
@@ -274,110 +273,40 @@ func handleSOCKS5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 	share.CopyBufPool.Put(b)
 }
 
-func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
-	dnsData, err := r.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("pack dns: %w", err)
+func scheduleHyReconnect(ctx context.Context, c client.Client) {
+	// Рандомная задержка [30, 60) минут
+	const minDelay = 30 * time.Minute
+	const maxJitter = 30 * time.Minute
+
+	delay := minDelay
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxJitter)))
+	if err == nil {
+		delay += time.Duration(n.Int64())
 	}
 
-	for attempt := 0; attempt < 3; attempt++ {
-		hyClient, err := getHyClientFromPool()
-		if err != nil {
-			log.Printf("[ERR] get hyClient from pool: %v", err)
-			return nil, err
-		}
-
-		hyConn, err := hyClient.UDP()
-		if err != nil {
-			log.Printf("[ERR] dial UDP: %v", err)
-			clientPoolMu.Lock()
-			for i, c := range clientPool {
-				if c == hyClient {
-					c.Close()
-					clientPool[i] = nil
-					break
-				}
-			}
-			clientPoolMu.Unlock()
-			continue
-		}
-
-		if err := hyConn.Send(dnsData, gDNSUpstream); err != nil {
-			log.Printf("[ERR] failed dns send: %v", err)
-			hyConn.Close()
-			clientPoolMu.Lock()
-			for i, c := range clientPool {
-				if c == hyClient {
-					c.Close()
-					clientPool[i] = nil
-					break
-				}
-			}
-			clientPoolMu.Unlock()
-			continue
-		}
-
-		receiveDone := make(chan struct{})
-		var respPayload []byte
-		var receiveErr error
-
-		go func() {
-			defer close(receiveDone)
-			respPayload, _, receiveErr = hyConn.Receive()
-		}()
-
-		select {
-		case <-receiveDone:
-			hyConn.Close()
-			if receiveErr != nil {
-				log.Printf("[ERR] failed dns receive: %v", receiveErr)
-				clientPoolMu.Lock()
-				for i, c := range clientPool {
-					if c == hyClient {
-						c.Close()
-						clientPool[i] = nil
-						break
-					}
-				}
-				clientPoolMu.Unlock()
-				continue
-			}
-		case <-time.After(10 * time.Second):
-			hyConn.Close()
-			log.Printf("[WARN] DNS receive timeout for %s", r.Question[0].Name)
-			continue
-		case <-ctx.Done():
-			hyConn.Close()
-			return nil, ctx.Err()
-		}
-
-		respMsg := new(dns.Msg)
-		if err := respMsg.Unpack(respPayload); err != nil {
-			return nil, fmt.Errorf("unpack dns resp: %w", err)
-		}
-
-		return respMsg, nil
+	select {
+	case <-time.After(delay):
+	case <-ctx.Done():
+		return
 	}
 
-	return nil, fmt.Errorf("failed to forward DNS after 3 attempts")
+	// Ищем клиента в пуле и вытесняем его
+	clientPoolMu.Lock()
+	for i := 0; i < hyClientPoolSize; i++ {
+		if clientPool[i] == c {
+			clientPool[i] = nil // Убираем из пула, новые запросы его не получат
+			go func() {
+				// Даем 5 минут дожить текущим стримам (Graceful Shutdown)
+				time.Sleep(5 * time.Minute)
+				c.Close()
+			}()
+			break
+		}
+	}
+	clientPoolMu.Unlock()
 }
 
-func getHyClientFromPool() (client.Client, error) {
-	clientPoolMu.Lock()
-	defer clientPoolMu.Unlock()
-
-	if clientPool == nil {
-		clientPool = make([]client.Client, hyClientPoolSize)
-	}
-
-	// Round-robin selection
-	idx := poolIdx % hyClientPoolSize
-	poolIdx++
-
-	if clientPool[idx] != nil && !clientPool[idx].IsClosed() {
-		return clientPool[idx], nil
-	}
-
+func establishHyClient(idx int, ctx context.Context) (client.Client, error) {
 	if clientPool[idx] != nil {
 		clientPool[idx].Close()
 		clientPool[idx] = nil
@@ -386,7 +315,7 @@ func getHyClientFromPool() (client.Client, error) {
 	connFactory := &udpConnFactory{}
 	serverAddr, err := net.ResolveUDPAddr("udp", gServerAddr)
 	if err != nil {
-		return nil, fmt.Errorf("resolve server addr: %w", err)
+		return nil, err
 	}
 
 	cidGen := &customCIDGenerator{authKey: gAuthKey}
@@ -400,16 +329,72 @@ func getHyClientFromPool() (client.Client, error) {
 		},
 	}, cidGen)
 	if err != nil {
-		return nil, fmt.Errorf("create pool hysteria client: %w", err)
+		return nil, err
 	}
 
 	clientPool[idx] = hyClient
+
+	go scheduleHyReconnect(ctx, hyClient)
+
 	return hyClient, nil
 }
 
-func dialTCP(addr string) (net.Conn, error) {
+func getHyClientFromPool(ctx context.Context) (client.Client, error) {
+	// Глобальный мьютекс для защиты структуры пула и предотвращения шторма запросов
+	clientPoolMu.Lock()
+	defer clientPoolMu.Unlock()
+
+	if clientPool == nil {
+		clientPool = make([]client.Client, hyClientPoolSize)
+	}
+
+	// 1. Пытаемся взять случайный слот для равномерного распределения нагрузки
+	idx := mrand.Intn(hyClientPoolSize)
+	if clientPool[idx] != nil && !clientPool[idx].IsClosed() {
+		return clientPool[idx], nil
+	}
+
+	// 2. Если слот пуст или закрыт, пытаемся создать клиента именно в нем
+	hyClient, err := establishHyClient(idx, ctx)
+	if err == nil {
+		return hyClient, nil
+	}
+	log.Printf("[ERR] Failed to establish Hysteria client in slot %d: %v", idx, err)
+
+	// 3. Fallback: Ищем ЛЮБОЙ уже живой клиент в пуле
+	for i := 0; i < hyClientPoolSize; i++ {
+		if i == idx {
+			continue
+		}
+		if clientPool[i] != nil && !clientPool[i].IsClosed() {
+			return clientPool[i], nil
+		}
+	}
+
+	// 4. Последний шанс: Пытаемся создать клиента в других слотах с ретраями
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		select {
+		case <-time.After(time.Duration(attempt+1) * 300 * time.Millisecond):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+
+		nextIdx := (idx + 1 + attempt) % hyClientPoolSize
+		hyClient, err := establishHyClient(nextIdx, ctx)
+		if err == nil {
+			return hyClient, nil
+		}
+		lastErr = err
+		log.Printf("[ERR] Fallback Hysteria attempt %d failed: %v", attempt+1, err)
+	}
+
+	return nil, fmt.Errorf("all Hysteria pool attempts failed: %w", lastErr)
+}
+
+func dialTCP(addr string, ctx context.Context) (net.Conn, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		hyClient, err := getHyClientFromPool()
+		hyClient, err := getHyClientFromPool(ctx)
 		if err != nil {
 			log.Printf("[ERR] get hyClient from pool: %v", err)
 			return nil, err
@@ -483,7 +468,7 @@ func parseSOCKS5UDPAddr(buf []byte) (host string, port uint16, dataStart int, er
 
 // handleSocks5UDP handles a SOCKS5 UDP ASSOCIATE request.
 // It creates a UDP session, binds a local UDP socket, and proxies SOCKS5 UDP datagrams bidirectionally.
-func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.DnsCache) error {
+func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 	// Create UDP socket for relay
 	udpConn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -600,20 +585,8 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				continue
 			}
 
-			// Try DNS cache
-			var domainFromIp string
-			if c, ok := dnsCache.Load(host); ok {
-				domainFromIp = c.(string)
-				log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-			}
-
 			var isShouldBypass bool
-			if len(domainFromIp) > 0 {
-				isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-			} else {
-				isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-			}
-
+			isShouldBypass = bypass.ShouldBypass(host, gBypass)
 			if isShouldBypass {
 				targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
 				if err == nil {
@@ -666,7 +639,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 					}()
 
 					for attempt := 0; attempt < 3; attempt++ {
-						hyClient, err := getHyClientFromPool()
+						hyClient, err := getHyClientFromPool(ctx)
 						if err != nil {
 							log.Printf("[ERR] get hyClient from pool: %v", err)
 							continue

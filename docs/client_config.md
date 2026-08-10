@@ -1,179 +1,246 @@
-# Справочник параметров конфигурации клиента Umbrella
+# Umbrella Client Configuration Parameters Reference
 
-В графическом клиенте Umbrella все настройки задаются во внутренних редакторах (**Settings -> Config Editor** и **Phase Editor**). Ниже приведено детальное описание каждого параметра.
+In the Umbrella GUI client, all settings are defined in internal editors ( **Settings -> Config Editor** and **Phase Editor** ). Below is a detailed description of each parameter.
 
 ---
 
 ### protocol:
+
 ```yaml
 protocol: "xtls"
 ```
-Определяет основной протокол маскировки трафика.
-- **Допустимые значения**: `"xtls"`, `"hysteria"`, `"torrent"`.
-- **По умолчанию**: `"xtls"`.
+
+Defines the main traffic obfuscation protocol.
+* **Allowed values** : `"xtls"`,            `"hysteria"`,            `"torrent"`.
+* **Default** : `"xtls"`.
 
 ### server:
+
 ```yaml
-server: "1.2.3.4:443" # или 1.2.3.4:50000-50100 для torrent
+server: "1.2.3.4:443" # or 1.2.3.4:50000-50100 for torrent
 ```
-Адрес и порт вашего удаленного VPS сервера Umbrella.
-- **Для Torrent**: Можно указывать диапазон портов (например, `50000-50100`), если включен Port Hopping.
+
+Address and port of your remote Umbrella VPS server.
+* **For Torrent** : You can specify a port range (e.g.,            `50000-50100`) if Port Hopping is enabled.
 
 ### sni:
+
 ```yaml
 sni: "google.com"
 ```
-Server Name Indication. Домен, под который будет маскироваться соединение. Должен быть разрешен на стороне сервера.
-- **По умолчанию**: `"github.com"`.
+
+Server Name Indication. The domain that the connection will masquerade as. Must be allowed on the server side.
+* **Default** : `"github.com"`.
 
 ### listen:
+
 ```yaml
 listen: "0.0.0.0:1080"
 ```
-Локальный адрес и порт, на котором клиент поднимет SOCKS5 прокси-сервер.
-- **По умолчанию**: `"0.0.0.0:1080"`.
+
+Local address and port where the client will start the SOCKS5 proxy server.
+* **Default** : `"0.0.0.0:1080"`.
 
 ### udp:
+
 ```yaml
 udp: true
 ```
-Включает поддержку `UDP ASSOCIATE`. Необходим для работы голосовых звонков, игр и некоторых мессенджеров через прокси.
-- **По умолчанию**: `true`.
+
+Enables `UDP ASSOCIATE` support. Required for voice calls, games, and some messengers to work through the proxy.
+* **Default** : `true`.
 
 ### decoy-traffic:
+
 ```yaml
 decoy-traffic: false
 ```
-Включает глобальный модуль маскировки. Клиент будет имитировать активность обычного пользователя, выполняя редкие `HEAD` запросы к легитимным мировым ресурсам (Bing, Apple и др.) напрямую, размывая статистику IP-соединений и скрывая факт подключения только к одному серверу.
-- **По умолчанию**: `false`.
+
+Enables the global obfuscation module. The client will simulate regular user activity by performing rare requests to legitimate global resources (Bing, Apple, etc.) directly, blurring IP connection statistics and hiding the fact of connecting to only one server.
+* **Default** : `false`.
 
 ### shaper:
+
 ```yaml
 shaper: false
 ```
-Активирует систему изменения формы трафика (Traffic Shaping). Позволяет имитировать паттерны передачи данных различных приложений. Требует настройки фаз в **Phase Editor**.
-- **По умолчанию**: `false`.
+
+Activates the Traffic Shaping system. Allows simulating data transfer patterns of various applications. Requires phase configuration in the **Phase Editor** .
+* **Default** : `false`.
 
 ### phases-file:
+
 ```yaml
 phases-file: "phases.yml"
 ```
-Путь к файлу с описанием фаз шейпера. В UI клиенте редактируется через **Phase Editor**.
-- **По умолчанию**: `"phases.yml"`.
 
-### dns-listen:
-```yaml
-dns-listen: "127.0.0.1:53"
-```
-Включает встроенный локальный DNS-сервер. Помогает предотвратить утечки DNS-запросов (DNS Leak) и обеспечивает работу правил маршрутизации (Bypass).
-- **По умолчанию**: `""` (выключено).
-
-### dns-upstream:
-```yaml
-dns-upstream: "8.8.8.8:53"
-```
-DNS-сервер, которому будут перенаправляться запросы через защищенный туннель.
-- **По умолчанию**: `"8.8.8.8:53"`.
+Path to the file containing shaper phase descriptions. In the GUI client, it is edited via the **Phase Editor** .
+* **Default** : `"phases.yml"`.
 
 ### bypass:
+
 ```yaml
 bypass:
   - "192.168.1.0/24"
   - "gosuslugi.ru"
 ```
-Список IP-сетей (в формате CIDR) или доменных имен, соединения с которыми должны идти напрямую через локального провайдера, минуя защищенный туннель.
+
+List of IP networks (in CIDR format) or domain names for which connections should go directly through the local provider, bypassing the secure tunnel.
 
 ---
 
-## Раздел XTLS (Reality + Vision)
+## XHTTP Section (HTTP/2 & HTTP/3 Tunnel)
+
+### xhttp.auth-key:
+
+```yaml
+xhttp:
+  auth-key: "hex_string_32_bytes"
+```
+
+Secret key for HMAC authentication between client and server. Must be 64 hex characters (32 bytes).
+
+### xhttp.quic:
+
+```yaml
+xhttp:
+  quic: false
+```
+
+Enables HTTP/3 (QUIC) instead of HTTP/2 as the underlying transport.
+* **Default** : `false`.
+
+### xhttp.path:
+
+```yaml
+xhttp:
+  path: "/api/v1/update"
+```
+
+The HTTP path used for establishing the tunnel.
+
+### xhttp.mode:
+
+```yaml
+xhttp:
+  mode: "stream-one"
+```
+
+Defines the tunneling mode:
+* **stream-one** : A single long-lived POST request for both uplink and downlink.
+* **stream-up** : Uses a GET request for downlink and a separate long-lived POST for uplink.
+* **packet-up** : Uses a GET request for downlink and splits uplink data into multiple small POST requests (useful for bypassing CDN or firewall restrictions).
+* **Default** : `"stream-one"`.
 
 ### xtls.public-key:
+
 ```yaml
 xtls:
   public-key: "YOUR_PUBLIC_KEY"
 ```
-Публичный ключ сервера для технологии Reality. Генерируется сервером при первом запуске.
+
+Server's public key for Reality technology. Generated by the server on its first run.
 
 ### xtls.short-id:
+
 ```yaml
 xtls:
   short-id: "hex_string"
 ```
-Идентификатор Reality сессии. Должен строго совпадать с настройками на сервере.
+
+Reality session identifier. Must strictly match the settings on the server.
 
 ### xtls.sessions-num:
+
 ```yaml
 xtls:
-  sessions-num: 5
+  sessions-num: 2
 ```
-Количество параллельных TCP/TLS соединений в пуле мультиплексирования. Увеличение может помочь на нестабильных сетях или для поднятия скорости многопоточной загрузки.
-- **По умолчанию**: `5`.
+
+Number of parallel TCP/TLS connections in the multiplexing pool. Increasing this may help on unstable networks or to boost multi-threaded download speeds.
+* **Default** : `2`.
 
 ### xtls.connections-time-out:
+
 ```yaml
 xtls:
-  connections-time-out: 60
+  connections-time-out: 70
 ```
-Таймаут в секундах, после которого неактивное соединение в пуле будет закрыто и заменено новым.
-- **По умолчанию**: `60`.
+
+Timeout in seconds after which an inactive connection in the pool will be closed and replaced with a new one.
+* **Default** : `70`.
 
 ---
 
-## Раздел Hysteria (Hysteria 2)
+## Hysteria Section (Hysteria 2)
 
 ### hysteria.auth-key:
+
 ```yaml
 hysteria:
   auth-key: "hex_string_32_bytes"
 ```
-Секретный ключ для HMAC-аутентификации Umbrella. Используется для маскировки Connection ID и обеспечения прозрачного проксирования для неавторизованных запросов.
+
+Secret key for Umbrella HMAC authentication. Used to obfuscate Connection ID and provide transparent proxying for unauthorized requests.
 
 ### hysteria.auth-password:
+
 ```yaml
 hysteria:
   auth-password: "your_password"
 ```
-Пароль для стандартной аутентификации протокола Hysteria 2.
+
+Password for standard Hysteria 2 protocol authentication.
 
 ### hysteria.conns-num:
+
 ```yaml
 hysteria:
-  conns-num: 5
+  conns-num: 2
 ```
-Количество независимых UDP-клиентов (сессий). Помогает обходить ограничения некоторых провайдеров на объем трафика или количество пакетов в рамках одного UDP-потока.
-- **По умолчанию**: `5`.
+
+Number of independent UDP clients (sessions). Helps bypass some provider restrictions on traffic volume or packet count within a single UDP stream.
+* **Default** : `2`.
 
 ---
 
-## Раздел Torrent (Torrent Stealth)
+## Torrent Section (Torrent Stealth)
 
 ### torrent.auth-key:
+
 ```yaml
 torrent:
   auth-key: "hex_string_32_bytes"
 ```
-Ключ для проверки HMAC PeerID при установке BitTorrent-рукопожатия. Обеспечивает безопасность и маскировку.
+
+Key for HMAC PeerID verification during the BitTorrent handshake. Provides security and obfuscation.
 
 ### torrent.info-hash:
+
 ```yaml
 torrent:
   info-hash: "40_hex_chars"
 ```
-Инфо-хеш торрент-раздачи, под которую маскируется трафик.
-- **Рекомендация**: Используйте реальный хеш популярных раздач (например, дистрибутивов Linux), чтобы маскировка под "White Noise" (запросы к трекерам) выглядела максимально правдоподобно.
+
+Info-hash of the torrent distribution that the traffic masquerades as.
+* **Recommendation** : Use a real hash of popular distributions (e.g., Linux distros) so that masquerading as "White Noise" (tracker requests) looks as plausible as possible.
 
 ### torrent.sessions-num:
+
 ```yaml
 torrent:
-  sessions-num: 5
+  sessions-num: 2
 ```
-Количество uTP-сессий в пуле мультиплексирования Yamux.
-- **По умолчанию**: `5`.
+
+Number of uTP sessions in the Yamux multiplexing pool.
+* **Default** : `2`.
 
 ### torrent.connections-time-out:
+
 ```yaml
 torrent:
-  connections-time-out: 60
+  connections-time-out: 70
 ```
-Период ротации торрент-соединений в секундах. Позволяет менять порты и PeerID для улучшения маскировки.
-- **По умолчанию**: `60`.
+
+Torrent connection rotation period in seconds. Allows changing ports and PeerID to improve obfuscation.
+* **Default** : `70`.

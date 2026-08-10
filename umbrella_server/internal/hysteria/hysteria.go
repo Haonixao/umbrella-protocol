@@ -14,7 +14,6 @@ import (
 	"net"
 	"sync"
 	"time"
-
 	"umbrella_server/internal/config"
 
 	"github.com/apernet/hysteria/core/v2/server"
@@ -236,17 +235,38 @@ func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
 	scid := packet[scidStart : scidStart+scidLen]
 
 	if len(scid) == 20 {
-		nonce := scid[:12]
-		mac := hmac.New(sha512.New, authKey)
-		mac.Write(nonce)
-		expectedMAC := mac.Sum(nil)[:8]
+		rnd := scid[0:5]
+		maskedTime := scid[5:8]
+		receivedSig := scid[8:20]
 
-		if hmac.Equal(scid[12:], expectedMAC) {
-			log.Printf("[INFO] Valid client (SCID HMAC), forwarding to Hysteria → %s", clientAddr.IP.String())
+		// 1. Восстанавливаем время через XOR
+		minBytes := make([]byte, 3)
+		for i := 0; i < 3; i++ {
+			minBytes[i] = maskedTime[i] ^ rnd[i]
+		}
+
+		// 2. Проверяем временное окно (± 2.5 минуты)
+		minutes := uint32(minBytes[0])<<16 | uint32(minBytes[1])<<8 | uint32(minBytes[2])
+		now := time.Now().UTC()
+		yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
+		clientTime := yearStart.Add(time.Duration(minutes) * time.Minute)
+
+		if now.Sub(clientTime).Abs() > 2*time.Minute+30*time.Second {
+			log.Printf("[INFO] Decoy: Hysteria CID time drift too high from %s", clientAddr.IP.String())
+			forwardToDest(packet, clientAddr)
+			return
+		}
+
+		// 3. Проверяем HMAC
+		mac := hmac.New(sha512.New, authKey)
+		mac.Write(rnd)
+		mac.Write(minBytes)
+		expectedSig := mac.Sum(nil)[:12]
+
+		if hmac.Equal(receivedSig, expectedSig) {
+			log.Printf("[INFO] Valid Hysteria client (Time+HMAC), forwarding → %s", clientAddr.IP.String())
 			forwardToHysteria(packet, clientAddr)
 			return
-		} else {
-			log.Printf("[ERR] HMAC verification failed for %s", clientAddr.IP.String())
 		}
 	} else if len(scid) > 0 {
 		log.Printf("[ERR] Unexpected SCID length: %d from %s", len(scid), clientAddr.IP.String())

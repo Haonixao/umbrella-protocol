@@ -42,8 +42,18 @@ func (fyneTheme) Color(name fyne.ThemeColorName, variant fyne.ThemeVariant) colo
 		return ColorToNRGBA(CurrentTheme.HighlightHigh)
 	case ftheme.ColorNameForeground:
 		return ColorToNRGBA(CurrentTheme.Text)
+	case ftheme.ColorNameScrollBar:
+		return ColorToNRGBA(CurrentTheme.Text)
+	case ftheme.ColorNameInputBorder:
+		return ColorToNRGBA(CurrentTheme.Iris)
+	case ftheme.ColorNameSelection:
+		return ColorToNRGBA(CurrentTheme.Iris)
+	case ftheme.ColorNameSeparator:
+		return ColorToNRGBA(CurrentTheme.Iris)
+  case ftheme.ColorNamePlaceHolder:
+		return ColorToNRGBA(CurrentTheme.Highlight)
 	default:
-		return ftheme.DefaultTheme().Color(name, variant)
+		return ColorToNRGBA(CurrentTheme.Base)
 	}
 }
 

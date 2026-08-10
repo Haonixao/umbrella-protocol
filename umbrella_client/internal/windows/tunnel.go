@@ -45,7 +45,7 @@ func NewTunnelCoreWindow(appRef fyne.App, appSettings *settings.AppSettings, l *
 			defer rc.Close()
 			pathEntry.SetText(rc.URI().Path())
 		}, tunnelCoreEditor)
-		fd.SetFilter(storage.NewExtensionFileFilter([]string{".exe", ".bin", ""}))
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".exe", ".bin", ".sh", ".bat", ""}))
 		fd.Show()
 	})
 
@@ -58,7 +58,6 @@ func NewTunnelCoreWindow(appRef fyne.App, appSettings *settings.AppSettings, l *
 			return
 		}
 		l.AppendLog("Tunnel core settings saved")
-		appRef.SendNotification(fyne.NewNotification("Saved", "Tunnel core settings saved"))
 		tunnelCoreEditor.Close()
 	})
 

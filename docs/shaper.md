@@ -1,32 +1,32 @@
 # Shaper
 
-**Задача.** Даже при правильном TLS fingerprint и скрытой аутентификации DPI может детектировать туннель по характеру потока: трафик ограничиваемых ресурсов может быть почти равномерным потоком или всплеск-пауза-всплеск. Shaper позволяет менять форму трафика за счет создания списка рандомно переключаемых фаз (если их больше одной) с ограничением скоростей. Можно определить просто одну фазу (тогда shaper начнет действовать как limiter).
+ **Task.** Even with correct TLS fingerprinting and hidden authentication, DPI (Deep Packet Inspection) can detect a tunnel based on traffic flow characteristics: the traffic of restricted resources often appears as a nearly uniform stream or a burst-pause-burst pattern. Shaper allows you to change the shape of the traffic by creating a list of randomly switched phases (if more than one is defined) with speed limits. You can define just a single phase, in which case the shaper acts as a simple limiter.
 
-**Как работает**
+ **How it works** 
 
-- При `shaper` клиент запускает локальный **phase engine**.
-- Бесконечный цикл случайно выбирает фазу (≠ предыдущей, если кол-во фаз > 1), длительность и применяет лимиты через token-bucket.
+* When `shaper` is enabled, the client launches a local **phase engine** .
+* An infinite loop randomly selects a phase (different from the previous one if the number of phases > 1) and its duration, then applies limits via a token-bucket algorithm.
 
-**Фазы:**
+ **Phases:** 
 
-| Фаза        | Длительность | ↓ Mbps | ↑ Mbps | Что имитирует                      |
+| Phase        | Duration | ↓ Mbps | ↑ Mbps | What it simulates                      |
 | ----------- | ------------ | ------ | ------ | ---------------------------------- |
-| `idle`      | 1–2 сек      | 0.0    | 0.0    | Простой                            |
-| `page_load` | 1–2 сек      | 12.0   | 0.8    | Загрузка HTML / CSS / JS / шрифтов |
-| `images`    | 1–2 сек      | 6.0    | 0.1    | Загрузка галереи / превью          |
-| `api_call`  | 1–2 сек      | 0.4    | 0.3    | Короткий XHR / fetch-запрос        |
-| `upload`    | 1–2 сек      | 0.3    | 4.0    | Загрузка файла или фото на сервер  |
+| `idle` | 1–2 sec      | 0.0    | 0.0    | Inactivity                            |
+| `page_load` | 1–2 sec      | 12.0   | 0.8    | Loading HTML / CSS / JS / fonts |
+| `images` | 1–2 sec      | 6.0    | 0.1    | Loading galleries / previews          |
+| `api_call` | 1–2 sec      | 0.4    | 0.3    | Short XHR / fetch requests        |
+| `upload` | 1–2 sec      | 0.3    | 4.0    | Uploading files or photos  |
 
-Детерминированного цикла нет: каждая следующая фаза выбирается случайно (≠ предыдущей, если кол-во фаз > 1), длительность в диапазоне. Паттерн нерегулярен.
+There is no deterministic cycle: each subsequent phase is chosen randomly, and the duration is within a specified range. This makes the pattern irregular.
 
-**Throttling.** Реализован встроенным token-bucket (без внешних deps). Фаза с 0 Mbps полностью блокирует запись. shapedWriter/shapedReader оборачивают io в throttle.
+ **Throttling.** Implemented using a built-in token-bucket (no external dependencies). A phase with 0 Mbps completely blocks writing. shapedWriter/shapedReader wrap the I/O operations into the throttle.
 
-**Пример.**
+ **Example.** 
 
-Как-то так примерно выглядит общая форма трафика Youtube когда вы смотрите видео (1080p 60fps). Довольно характерный паттерн.
+This is approximately what the overall traffic shape of YouTube looks like when watching a video (1080p 60fps). It is a quite distinctive pattern.
 
-![Скрин1](./screens/youtube.png)
+![Screen1](./screens/youtube.png)
 
-А вот так форму трафика можно поменять с помощью Shaper. Уже больше похоже на скачивание какого-то файла.
+And here is how the traffic shape can be modified using Shaper. It looks more like a file download.
 
-![Скрин2](./screens/youtube_shaped.png)
+![Screen2](./screens/youtube_shaped.png)

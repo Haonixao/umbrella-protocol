@@ -1,14 +1,13 @@
 package storage
 
 import (
-	"encoding/json"
+
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"time"
+
 
 	"fyne.io/fyne/v2"
 )
@@ -190,145 +189,4 @@ func SavePhases(b []byte, appFilesDir string, appRef fyne.App) error {
 		}
 	}
 	return nil
-}
-
-func DnsCacheFilePath(appFilesDir string) string {
-	if appFilesDir == "" {
-		return "dns_cache.json"
-	}
-	return filepath.Join(appFilesDir, "dns_cache.json")
-}
-
-type DnsCache struct {
-	mu   sync.RWMutex
-	data map[string]string
-}
-
-func NewDnsCache() *DnsCache {
-	return &DnsCache{
-		data: make(map[string]string),
-	}
-}
-
-func (d *DnsCache) Clear() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data = nil
-	d.data = make(map[string]string)
-}
-
-func (d *DnsCache) Load(key string) (any, bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	v, ok := d.data[key]
-	return v, ok
-}
-
-func (d *DnsCache) Store(key string, value string) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.data[key] = value
-}
-
-func (d *DnsCache) LoadAll() map[string]string {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	result := make(map[string]string, len(d.data))
-	for k, v := range d.data {
-		result[k] = v
-	}
-	return result
-}
-
-func (d *DnsCache) Range(f func(key, value any) bool) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for k, v := range d.data {
-		if !f(k, v) {
-			return
-		}
-	}
-}
-
-type dnsCacheFile struct {
-	Data      map[string]string `json:"data"`
-	Timestamp time.Time         `json:"timestamp"`
-}
-
-func LoadDnsCache(appFilesDir string) (*DnsCache, error) {
-	p := DnsCacheFilePath(appFilesDir)
-	b, err := os.ReadFile(p)
-	if err != nil {
-		return NewDnsCache(), nil
-	}
-	var cf dnsCacheFile
-	if err := json.Unmarshal(b, &cf); err != nil {
-		return NewDnsCache(), err
-	}
-	d := &DnsCache{
-		data: make(map[string]string),
-	}
-	for k, v := range cf.Data {
-		d.data[k] = v
-	}
-	return d, nil
-}
-
-func ClearDnsCache(d *DnsCache, appFilesDir string) error {
-	d.Clear()
-	p := DnsCacheFilePath(appFilesDir)
-
-	if appFilesDir != "" {
-		_ = os.MkdirAll(appFilesDir, 0o755)
-	}
-
-	data := d.LoadAll()
-	cf := dnsCacheFile{
-		Data:      data,
-		Timestamp: time.Now(),
-	}
-
-	b, err := json.Marshal(cf)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(p, b, 0o644)
-}
-
-func SaveDnsCache(d *DnsCache, appFilesDir string) error {
-	p := DnsCacheFilePath(appFilesDir)
-
-	if appFilesDir != "" {
-		_ = os.MkdirAll(appFilesDir, 0o755)
-	}
-
-	data := d.LoadAll()
-
-	existing, err := os.ReadFile(p)
-	if err == nil && len(existing) > 0 {
-		var cf dnsCacheFile
-		if err := json.Unmarshal(existing, &cf); err == nil {
-			if time.Since(cf.Timestamp) < 24*time.Hour {
-				for k, v := range data {
-					cf.Data[k] = v
-				}
-				b, err := json.Marshal(cf)
-				if err != nil {
-					return err
-				}
-				return os.WriteFile(p, b, 0o644)
-			}
-		}
-	}
-
-	cf := dnsCacheFile{
-		Data:      data,
-		Timestamp: time.Now(),
-	}
-	b, err := json.Marshal(cf)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(p, b, 0o644)
 }

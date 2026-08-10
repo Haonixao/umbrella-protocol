@@ -114,7 +114,6 @@ func ShowSavePresetDialog(appRef fyne.App, logsContainer *logging.LogsContainer,
 			return
 		}
 		logsContainer.AppendLog("Saved preset: " + name)
-		appRef.SendNotification(fyne.NewNotification("Preset Saved", name))
 		dialogWin.Close()
 	})
 

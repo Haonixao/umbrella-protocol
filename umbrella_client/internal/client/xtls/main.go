@@ -21,14 +21,13 @@ import (
 	"time"
 
 	"github.com/hashicorp/yamux"
-	"github.com/miekg/dns"
+
 	utls "github.com/refraction-networking/utls"
 
+	"umbrella_client/internal/client/bypass"
 	"umbrella_client/internal/client/config"
 	"umbrella_client/internal/client/shaper"
 	"umbrella_client/internal/client/share"
-	"umbrella_client/internal/client/umbrella_dns"
-	"umbrella_client/internal/storage"
 )
 
 // Global session state — all SOCKS5 connections share one TLS connection.
@@ -42,14 +41,12 @@ var (
 	gConnectionsTimeOut time.Duration
 	gSessionsNum        int
 	gBypass             []string
-	gDNSListen          string
-	gDNSUpstream        string
 	sessMu              []sync.Mutex
 	getSessionMu        sync.Mutex // Global lock to prevent simultaneous session establishment
 	sessions            []*yamux.Session
 )
 
-func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache *storage.DnsCache) error {
+func Start(cfg *config.Config, ctx context.Context, appFilesDir string) error {
 	mrand.Seed(time.Now().UnixNano())
 
 	gUDPEnabled = cfg.UDPEnabled
@@ -58,8 +55,6 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 	gSessionsNum = cfg.Xtls.SessionsNum
 	gBypass = make([]string, len(cfg.Bypass))
 	copy(gBypass, cfg.Bypass)
-	gDNSListen = cfg.DNSListen
-	gDNSUpstream = cfg.DNSUpstream
 
 	pubKey, err := base64.StdEncoding.DecodeString(cfg.Xtls.PublicKey)
 	if err != nil || len(pubKey) != 32 {
@@ -126,12 +121,6 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 	}
 	log.Printf("[INFO] Umbrella/Xtls client on %s (SOCKS5) → %s (SNI: %s)", cfg.ListenAddr, cfg.Server, cfg.SNI)
 
-	if gDNSListen != "" {
-		go func() {
-			umbrella_dns.RunDNSServer(ctx, dnsCache, gBypass, gDNSListen, gDNSUpstream, forwardDNS)
-		}()
-	}
-
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -182,82 +171,10 @@ func Start(cfg *config.Config, ctx context.Context, appFilesDir string, dnsCache
 			}
 
 			go func() {
-				handleSocks5(ctx, conn, dnsCache)
+				handleSocks5(ctx, conn)
 			}()
 		}
 	}
-}
-
-// forwardDNS sends a DNS query to the upstream server via the Umbrella tunnel.
-func forwardDNS(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {
-	s, err := getSession(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get session: %w", err)
-	}
-
-	stream, err := openVisionUDPStream(s)
-	if err != nil {
-		return nil, fmt.Errorf("open UDP stream: %w", err)
-	}
-	defer stream.Close()
-
-	// Prepare length-prefixed UDP frame for our relay protocol:
-	// [4B len][ATYP+ADDR+PORT+DATA]
-	dnsData, err := r.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("pack dns: %w", err)
-	}
-
-	host, portStr, _ := net.SplitHostPort(gDNSUpstream)
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
-
-	// Build relay header: [ATYP][ADDR][PORT]
-	var addrBytes []byte
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			addrBytes = append([]byte{0x01}, ip4...)
-		} else {
-			addrBytes = append([]byte{0x04}, ip.To16()...)
-		}
-	} else {
-		addrBytes = append([]byte{0x03, byte(len(host))}, []byte(host)...)
-	}
-	var portBytes [2]byte
-	binary.BigEndian.PutUint16(portBytes[:], port)
-
-	payload := append(addrBytes, portBytes[:]...)
-	payload = append(payload, dnsData...)
-
-	if err := visionWriteDatagram(stream, payload); err != nil {
-		return nil, err
-	}
-
-	// Read response
-	respPayload, err := visionReadDatagram(stream)
-	if err != nil {
-		return nil, err
-	}
-
-	// Skip ATYP+ADDR+PORT in response (server returns them)
-	// Response from server is [ATYP][ADDR][PORT][DATA]
-	off := 0
-	switch respPayload[0] {
-	case 0x01:
-		off = 1 + 4 + 2
-	case 0x04:
-		off = 1 + 16 + 2
-	case 0x03:
-		off = 1 + 1 + int(respPayload[1]) + 2
-	}
-
-	respMsg := new(dns.Msg)
-	if err := respMsg.Unpack(respPayload[off:]); err != nil {
-		return nil, fmt.Errorf("unpack dns resp: %w", err)
-	}
-
-	return respMsg, nil
 }
 
 // getSession returns a multiplexed session from the pool, creating one if needed.
@@ -445,13 +362,9 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	return sess, nil
 }
 
-// scheduleReconnect waits a random interval (3–15 min) then removes the session
-// from global state. Active yamux streams finish naturally; the next SOCKS5
-// request will transparently create a fresh TLS connection with a new handshake.
 func scheduleReconnect(ctx context.Context, s *yamux.Session) {
-	// Random delay in [3, 15) minutes using crypto/rand for unpredictability.
-	const minDelay = 3 * time.Minute
-	const maxJitter = 12 * time.Minute
+	const minDelay = 30 * time.Minute
+	const maxJitter = 30 * time.Minute
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxJitter)))
 	delay := minDelay
 	if err == nil {
@@ -592,7 +505,7 @@ func (ts *timeoutPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error)
 // and proxies SOCKS5 UDP datagrams bidirectionally until the TCP control
 // connection is closed by the client (RFC 1928).
 // Uses Vision framing for all UDP datagrams.
-func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.DnsCache) {
+func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) {
 	var (
 		err    error
 		s      *yamux.Session
@@ -722,20 +635,8 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 				continue
 			}
 
-			// Try DNS cache
-			var domainFromIp string
-			if c, ok := dnsCache.Load(host); ok {
-				domainFromIp = c.(string)
-				log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-			}
-
 			var isShouldBypass bool
-			if len(domainFromIp) > 0 {
-				isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-			} else {
-				isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-			}
-
+			isShouldBypass = bypass.ShouldBypass(host, gBypass)
 			if isShouldBypass {
 				// Bypass! Send directly.
 				targetAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", port)))
@@ -790,7 +691,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn, dnsCache *storage.Dn
 }
 
 // handleSocks5 handles an incoming SOCKS5 connection from a local application.
-func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache) {
+func handleSocks5(ctx context.Context, conn net.Conn) {
 	conn = &timeoutConn{Conn: conn}
 
 	defer func() {
@@ -803,25 +704,13 @@ func handleSocks5(ctx context.Context, conn net.Conn, dnsCache *storage.DnsCache
 		return
 	}
 
-	// Try DNS cache
-	var domainFromIp string
-	if c, ok := dnsCache.Load(host); ok {
-		domainFromIp = c.(string)
-		log.Printf("[INFO] Resolved %s → %s (from DNS cache)", host, domainFromIp)
-	}
-
 	if cmd == 0x03 { // UDP ASSOCIATE
-		handleSocks5UDP(ctx, conn, dnsCache)
+		handleSocks5UDP(ctx, conn)
 		return
 	}
 
 	var isShouldBypass bool
-	if len(domainFromIp) > 0 {
-		isShouldBypass = umbrella_dns.ShouldBypass(domainFromIp, gBypass)
-	} else {
-		isShouldBypass = umbrella_dns.ShouldBypass(host, gBypass)
-	}
-
+	isShouldBypass = bypass.ShouldBypass(host, gBypass)
 	if isShouldBypass {
 		conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		share.HandleDirect(ctx, conn, host, port)

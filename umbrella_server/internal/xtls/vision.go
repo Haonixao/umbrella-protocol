@@ -1,7 +1,6 @@
 package xtls
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -24,20 +23,25 @@ const (
 	maxVisionPadding = 255
 )
 
-
-
 // visionCopyToTunnel reads raw data from src, wraps each chunk in a Vision frame with padding,
 // and writes it to dst. This version is universal and doesn't assume src is TLS.
 func visionCopyToTunnel(dst io.Writer, src io.Reader) error {
-	br := bufio.NewReaderSize(src, 32*1024)
-	buf := make([]byte, 16*1024) // Chunk size for framing
+	// Берем большой буфер из пула вместо make([]byte, 16*1024)
+	bufPtr := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bufPtr)
+	buf := *bufPtr
+
+	// Ограничиваем срез до нужного нам размера чанка (например, 16КБ)
+	chunkBuf := buf[:16*1024]
+
 	hdr := make([]byte, 5)
 	framePfx := make([]byte, 2)
-	padBuf := make([]byte, 256) // Pre-allocated padding buffer
+	// padBuf тоже можно взять из пула, но он маленький (256 байт),
+	// поэтому оставим локальным или вынесем в глобальную переменную.
+	padBuf := make([]byte, 256)
 
 	for {
-		// Read whatever is available (up to 16KB)
-		n, err := br.Read(buf)
+		n, err := src.Read(chunkBuf) // Читаем напрямую в буфер из пула
 		if err != nil {
 			return err
 		}
@@ -134,36 +138,38 @@ func visionRandPadLen() (uint16, error) {
 // [payloadLen bytes: UDP payload]
 
 // visionReadDatagram читает один Vision-UDP фрейм из src и возвращает raw payload.
-func visionReadDatagram(src io.Reader) ([]byte, error) {
-	hdr := make([]byte, 5)
-	if _, err := io.ReadFull(src, hdr); err != nil {
-		return nil, fmt.Errorf("read vision udp hdr: %w", err)
+func visionReadDatagram(src io.Reader) ([]byte, *[]byte, error) {
+	// Используем временный буфер для заголовка, чтобы не брать из пула раньше времени
+	var hdr [5]byte
+	if _, err := io.ReadFull(src, hdr[:]); err != nil {
+		return nil, nil, fmt.Errorf("read vision udp hdr: %w", err)
 	}
 	totalLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 
-	pfxBuf := make([]byte, 2)
-	if _, err := io.ReadFull(src, pfxBuf); err != nil {
-		return nil, fmt.Errorf("read padLen: %w", err)
-	}
-	padLen := int(binary.BigEndian.Uint16(pfxBuf))
+	bufPtr := udpBufPool.Get().(*[]byte)
+	buf := *bufPtr
 
-	if padLen > 0 {
-		if _, err := io.CopyN(io.Discard, src, int64(padLen)); err != nil {
-			return nil, fmt.Errorf("skip padding: %w", err)
-		}
+	if _, err := io.ReadFull(src, buf[:totalLen]); err != nil {
+		udpBufPool.Put(bufPtr)
+		return nil, nil, err
 	}
 
-	payloadLen := totalLen - 2 - padLen
-	if payloadLen < 0 {
-		return nil, fmt.Errorf("vision udp: invalid frame length")
+	// Проверка безопасности: заголовок padLen (2 байта) должен помещаться
+	if totalLen < 2 {
+		udpBufPool.Put(bufPtr)
+		return nil, nil, fmt.Errorf("vision: frame too short")
 	}
 
-	payload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(src, payload); err != nil {
-		return nil, fmt.Errorf("read payload: %w", err)
+	padLen := int(binary.BigEndian.Uint16(buf[0:2]))
+
+	// 3. Возвращаем проверку на отрицательную или некорректную длину payload
+	if totalLen < 2+padLen {
+		udpBufPool.Put(bufPtr)
+		return nil, nil, fmt.Errorf("vision: invalid padding length")
 	}
 
-	return payload, nil
+	payload := buf[2+padLen : totalLen]
+	return payload, bufPtr, nil
 }
 
 // visionWriteDatagram записывает один Vision-UDP фрейм (Header + Padding + Payload) в dst.
@@ -173,7 +179,7 @@ func visionWriteDatagram(dst io.Writer, payload []byte) error {
 		return fmt.Errorf("vision rand: %w", err)
 	}
 
-	// Ensure total length (2 + padLen + len(payload)) doesn't exceed 65535 (uint16 limit).
+	// 1. Возвращаем корректную проверку переполнения uint16
 	if 2+int(padLen)+len(payload) > 65535 {
 		if len(payload) > 65533 {
 			padLen = 0
@@ -181,39 +187,31 @@ func visionWriteDatagram(dst io.Writer, payload []byte) error {
 			padLen = uint16(65535 - 2 - len(payload))
 		}
 	}
+	totalBodyLen := 2 + int(padLen) + len(payload)
 
-	// 1. Write Fake TLS Header (5 bytes)
-	hdr := make([]byte, 5)
-	hdr[0] = 0x17
-	hdr[1] = 0x03
-	hdr[2] = 0x03
-	binary.BigEndian.PutUint16(hdr[3:5], uint16(2+int(padLen)+len(payload)))
-	if _, err := dst.Write(hdr); err != nil {
-		return fmt.Errorf("write hdr: %w", err)
-	}
+	bufPtr := udpBufPool.Get().(*[]byte)
+	defer udpBufPool.Put(bufPtr)
+	buf := *bufPtr
 
-	// 2. Write PadLen field (2 bytes)
-	pfxBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(pfxBuf, padLen)
-	if _, err := dst.Write(pfxBuf); err != nil {
-		return fmt.Errorf("write padLen: %w", err)
-	}
+	// 2. Сборка фрейма
+	buf[0] = 0x17
+	buf[1] = 0x03
+	buf[2] = 0x03
+	binary.BigEndian.PutUint16(buf[3:5], uint16(totalBodyLen)) // Длина тела фрейма
 
-	// 3. Write Padding (random noise)
+	binary.BigEndian.PutUint16(buf[5:7], padLen)
+
+	off := 7
 	if padLen > 0 {
-		pad := make([]byte, padLen)
-		if _, err := rand.Read(pad); err != nil {
-			return fmt.Errorf("write padding: %w", err)
-		}
-		if _, err := dst.Write(pad); err != nil {
-			return fmt.Errorf("write padding: %w", err)
-		}
+		rand.Read(buf[off : off+int(padLen)])
+		off += int(padLen)
 	}
 
-	// 4. Write Payload
-	if _, err := dst.Write(payload); err != nil {
-		return fmt.Errorf("write payload: %w", err)
-	}
+	copy(buf[off:], payload)
+	off += len(payload)
 
+	if _, err := dst.Write(buf[:off]); err != nil {
+		return fmt.Errorf("vision write: %w", err)
+	}
 	return nil
 }

@@ -2,7 +2,7 @@ module umbrella_server
 
 go 1.26.0
 
-replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260512111648-6d2d2fc87c8c
+replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260903070339-0c968f3e07fc
 
 replace github.com/apernet/hysteria/core/v2 => github.com/Haonixao/hysteria/core/v2 v2.0.0-20260806122212-1514bdd0b820
 

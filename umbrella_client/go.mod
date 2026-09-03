@@ -6,11 +6,7 @@ replace github.com/apernet/hysteria/core/v2 => github.com/Haonixao/hysteria/core
 
 replace github.com/apernet/hysteria/extras/v2 => github.com/Haonixao/hysteria/extras/v2 v2.0.0-20260806122212-1514bdd0b820
 
-// replace github.com/apernet/hysteria/core/v2/internal/congestion => github.com/Haonixao/hysteria/core/v2/internal/congestion v2.0.0-20260803173140-4d6282b5f3aa
-
-// replace github.com/apernet/hysteria/core/v2/internal/congestion/bbr => github.com/Haonixao/hysteria/core/v2/internal/congestion/bbr v2.0.0-20260803173140-4d6282b5f3aa
-
-replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260512111648-6d2d2fc87c8c
+replace github.com/anacrolix/utp => github.com/Haonixao/utp v0.0.0-20260903070339-0c968f3e07fc
 
 require (
 	fyne.io/fyne/v2 v2.8.0

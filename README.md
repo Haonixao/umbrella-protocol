@@ -83,7 +83,6 @@ A modern graphical interface providing full control over the tunnel and system s
 * **Settings Window**:
   + **Config Editor**: Built-in `config.yaml` editor (structure validation before saving).
   + **Phase Editor**: Configuring Shaper behavior through a phase editor.
-  + **Presets**: A system for saving and instantly switching between setting profiles.
   + **Tunnel Core**: Integration with third-party tools (Mihomo, sing-box, ProxiFyre).
 * **Personalization**:
   + **Themes**: Choice of several predefined themes.

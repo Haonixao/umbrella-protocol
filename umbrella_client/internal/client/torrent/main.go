@@ -5,9 +5,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -423,19 +421,20 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		return nil, err
 	}
 
-	peerID, nonce := generatePeerID()
+	// Generate standard BitTorrent peer_id
+	clientPeerID := generatePeerID()
 	handshake := make([]byte, handshakeLen)
 	handshake[0] = pstrlen
 	copy(handshake[1:20], pstr)
 	copy(handshake[28:48], gInfoHash[:])
-	copy(handshake[48:68], peerID[:])
+	copy(handshake[48:68], clientPeerID[:])
 
 	if _, err := s.Write(handshake); err != nil {
 		s.Close()
 		return nil, err
 	}
 
-	// 3. Receive server handshake
+	// Receive server handshake
 	s.SetReadDeadline(time.Now().Add(30 * time.Second))
 	respHandshake := make([]byte, handshakeLen)
 	if _, err := io.ReadFull(s, respHandshake); err != nil {
@@ -443,6 +442,8 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 		return nil, err
 	}
 	s.SetReadDeadline(time.Time{})
+
+	serverPeerID := append([]byte{}, respHandshake[48:68]...)
 
 	s.Write([]byte{0, 0, 0, 1, interestedID})
 	s.Write([]byte{0, 0, 0, 1, unchokeMsgID})
@@ -453,7 +454,7 @@ func establishSession(ctx context.Context, idx int) (*yamux.Session, error) {
 	muxCfg.StreamCloseTimeout = 10 * time.Second
 	muxCfg.LogOutput = io.Discard
 
-	sess, err := yamux.Client(NewTorrentConn(s, gAuthKey, gInfoHash, nonce), muxCfg)
+	sess, err := yamux.Client(NewTorrentConn(s, gAuthKey, clientPeerID[:], serverPeerID), muxCfg)
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -506,43 +507,11 @@ func dropSession(s *yamux.Session) {
 	}
 }
 
-func generatePeerID() ([20]byte, []byte) {
+func generatePeerID() [20]byte {
 	var pid [20]byte
 	copy(pid[:8], []byte("-TR4000-"))
-
-	// 1. Генерируем 5 случайных байт (как в вашем TLS примере)
-	// Но так как места мало, возьмем 4 байта
-	rnd := make([]byte, 4)
-	rand.Read(rnd)
-
-	// 2. Получаем минуты с начала года (3 байта)
-	now := time.Now().UTC()
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	minutes := uint32(now.Sub(yearStart).Minutes())
-	minBytes := make([]byte, 3)
-	minBytes[0] = byte(minutes >> 16)
-	minBytes[1] = byte(minutes >> 8)
-	minBytes[2] = byte(minutes)
-
-	// 3. Зашумляем время через XOR с частью rnd
-	maskedTime := make([]byte, 3)
-	for i := 0; i < 3; i++ {
-		maskedTime[i] = minBytes[i] ^ rnd[i]
-	}
-
-	// Собираем: [Prefix:8][Rnd:4][MaskedTime:3][HMAC:5]
-	copy(pid[8:12], rnd)
-	copy(pid[12:15], maskedTime)
-
-	// 4. Подпись HMAC от Rnd + Real Minutes + InfoHash
-	mac := hmac.New(sha1.New, gAuthKey)
-	mac.Write(rnd)
-	mac.Write(minBytes)
-	mac.Write(gInfoHash[:])
-	sig := mac.Sum(nil)[:5]
-	copy(pid[15:20], sig)
-
-	return pid, rnd // Возвращаем rnd как nonce для AES
+	rand.Read(pid[8:20])
+	return pid
 }
 
 type TorrentConn struct {
@@ -557,26 +526,30 @@ type TorrentConn struct {
 	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, clientPeerID, serverPeerID []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
 	}
 
-	// Initialize AES-CTR for light payload encryption
 	// Key = SHA256(AuthKey)
-	// IV = SHA256(nonce + InfoHash)[:16]
+	// IV = SHA256(AuthKey + clientPeerID + serverPeerID)
+	// clientPeerID = initiator's peer_id (this client)
+	// serverPeerID = responder's peer_id (server)
 	key := sha256.Sum256(authKey)
-	ivSeed := append(nonce, infoHash[:]...)
+	ivSeed := append(append([]byte{}, authKey...), clientPeerID...)
+	ivSeed = append(ivSeed, serverPeerID...)
 	iv := sha256.Sum256(ivSeed)
 
 	block, err := aes.NewCipher(key[:])
 	if err == nil {
+		// Client enc uses iv[:16], client dec uses iv[16:32]
+		// Server enc uses iv[16:32], server dec uses iv[:16]
+		// So client->server is iv[:16] on both sides, server->client is iv[16:32] on both sides
 		tc.enc = cipher.NewCTR(block, iv[:16])
-		tc.dec = cipher.NewCTR(block, iv[16:32]) // Use second half of SHA256 for symmetry
+		tc.dec = cipher.NewCTR(block, iv[16:32])
 	}
 
-	// Оборачиваем запись в буфер для снижения оверхеда паддинга
 	tc.writer = bufio.NewWriterSize(&rawPieceWriter{tc}, 16*1024)
 	return tc
 }
@@ -620,26 +593,22 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 			continue
 		}
 
-		// Читаем ID (1 байт)
 		msgID, err := c.reader.ReadByte()
 		if err != nil {
 			return 0, err
 		}
 
 		if msgID == pieceMsgID {
-			// Discard Index(4) + Offset(4) = 8 bytes
 			if _, err := c.reader.Discard(8); err != nil {
 				return 0, err
 			}
 
-			// Читаем наш внутренний заголовок PayloadLen (2 байта)
 			var pLenBuf [2]byte
 			if _, err := io.ReadFull(c.reader, pLenBuf[:]); err != nil {
 				return 0, err
 			}
 			pLen := int(binary.BigEndian.Uint16(pLenBuf[:]))
 
-			// Общий остаток в этом piece (за вычетом Index+Offset+PayloadLen)
 			totalInPiece := int(length) - 11
 			if pLen > totalInPiece {
 				return 0, fmt.Errorf("torrent protocol corruption: payload %d > total %d", pLen, totalInPiece)
@@ -652,7 +621,6 @@ func (c *TorrentConn) Read(p []byte) (n int, err error) {
 				continue
 			}
 		} else {
-			// Пропускаем другие типы сообщений
 			if _, err := c.reader.Discard(int(length) - 1); err != nil {
 				return 0, err
 			}

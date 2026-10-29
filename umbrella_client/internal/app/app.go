@@ -2,10 +2,7 @@ package app
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,171 +18,12 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"umbrella_client/internal/client/config"
-	"umbrella_client/internal/client/decoy"
-	"umbrella_client/internal/client/hysteria"
-	"umbrella_client/internal/client/torrent"
-	"umbrella_client/internal/client/xhttp"
-	"umbrella_client/internal/client/xtls"
 	"umbrella_client/internal/logging"
 	"umbrella_client/internal/settings"
 	"umbrella_client/internal/storage"
-	"umbrella_client/internal/tunnel"
 	"umbrella_client/internal/ui"
 	"umbrella_client/internal/windows"
 )
-
-func initAndStart(appSettings *settings.AppSettings, l *logging.LogsContainer, appRef fyne.App, isRunning *bool, ctx context.Context, startEnabled, stopEnabled binding.Bool, onceLog *sync.Once) {
-	// Set up logging first to capture all output
-	onceLog.Do(func() {
-		log.SetOutput(&logging.LogWriter{LogsContainer: l})
-		log.SetFlags(0)
-	})
-	err := os.MkdirAll(appSettings.AppFilesDir, 0o755)
-	if err != nil {
-		l.AppendLog("[ERR] Failed to create directory: " + err.Error())
-		finish("Status: Directory Error", isRunning, l, startEnabled, stopEnabled)
-		return
-	}
-
-	l.AppendLog("Loading config.yaml from storage/disk...")
-
-	configData, err := storage.LoadConfig(appSettings.AppFilesDir, appRef)
-	if err != nil {
-		l.AppendLog("[ERR] Cannot read config.yaml: " + err.Error())
-		finish("Status: Config Error", isRunning, l, startEnabled, stopEnabled)
-		return
-	}
-
-	l.AppendLog("Parsing configuration...")
-	cfg, err := config.ParseConfig(configData)
-	if err != nil {
-		l.AppendLog("[ERR] Config parse failed: " + err.Error())
-		finish("Status: Config Error", isRunning, l, startEnabled, stopEnabled)
-		return
-	}
-
-	// Load phases data from storage/disk (required)
-	phasesData, err := storage.LoadPhases(appSettings.AppFilesDir, appRef)
-	if err != nil {
-		l.AppendLog("[ERR] Cannot read phases.yml: " + err.Error())
-		finish("Status: Phases Error", isRunning, l, startEnabled, stopEnabled)
-		return
-	}
-	cfg.PhasesData = phasesData
-
-	// Log what will be started
-	l.AppendLog(fmt.Sprintf("Starting client on %s", cfg.ListenAddr))
-
-	if cfg.Shaper {
-		l.AppendLog("Traffic shaping: enabled")
-	}
-	if cfg.DecoyTraffic {
-		l.AppendLog("Decoy traffic: enabled")
-		go decoy.StartGlobalDecoy(ctx)
-	}
-
-	// Start tunnel core if configured
-	var pr *os.Process
-	if appSettings.TunnelCorePath != "" {
-		if pr, err = tunnel.StartTunnelCore(appSettings.TunnelCorePath, appSettings.TunnelCoreArgs, l); err != nil {
-			l.AppendLog("[ERR] Failed to start tunnel core: " + err.Error())
-			finish("Status: Tunnel Core Error", isRunning, l, startEnabled, stopEnabled)
-			return
-		}
-	}
-
-	// Run client in a goroutine
-	go func() {
-		defer func() {
-			// Ensure we always call finish and handle panics
-			if r := recover(); r != nil {
-				l.AppendLog(fmt.Sprintf("[Panic] Client crashed: %v", r))
-				finish("Status: Crashed", isRunning, l, startEnabled, stopEnabled)
-			} else if *isRunning {
-				// Normal exit
-				l.AppendLog("Client stopped, updating status")
-				finish("Status: Stopped", isRunning, l, startEnabled, stopEnabled)
-			}
-			if appSettings.TunnelCorePath != "" {
-				if err := tunnel.StopTunnelCore(pr); err == nil {
-					l.AppendLog("Tunnel core stopped")
-				} else {
-					l.AppendLog("[ERR] Tunnel core not stopped. Need a manual stop process. " + err.Error())
-				}
-			}
-		}()
-
-		l.AppendLog("Starting client...")
-		var start func(cfg *config.Config, ctx context.Context, appFilesDir string) error
-		switch cfg.Protocol {
-		case "xtls":
-			start = xtls.Start
-		case "hysteria":
-			start = hysteria.Start
-		case "torrent":
-			start = torrent.Start
-		case "xhttp":
-			start = xhttp.Start
-		default:
-			l.AppendLog("[ERR] Client failed to start: not valid protocol")
-			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
-		}
-		err = start(cfg, ctx, appSettings.AppFilesDir)
-		if err != nil {
-			if strings.Contains(err.Error(), "failed to listen on "+cfg.ListenAddr) {
-				if runtime.GOOS != "android" {
-					switch runtime.GOOS {
-					case "windows":
-						errR := exec.Command("net", "stop", "winnat").Run()
-						if errR == nil {
-							errR = exec.Command("net", "start", "winnat").Run()
-						}
-						if errR != nil {
-							l.AppendLog("[ERR] Failed net command: " + errR.Error())
-							finish("Status: Failed net command", isRunning, l, startEnabled, stopEnabled)
-							return
-						}
-					case "linux":
-						if errR := exec.Command("sh", "-c", "fuser -k 1080/tcp").Run(); errR != nil {
-							l.AppendLog("[ERR] Failed net sh: " + errR.Error())
-							finish("Status: Failed net sh", isRunning, l, startEnabled, stopEnabled)
-							return
-						}
-					}
-					err = start(cfg, ctx, appSettings.AppFilesDir)
-				}
-			}
-
-			l.AppendLog(fmt.Sprintf("[ERR] Client failed to start: %v", err))
-			if runtime.GOOS != "android" {
-				var comm string
-				switch runtime.GOOS {
-				case "windows":
-					comm = "net stop winnat && net start winnat"
-				case "linux":
-					comm = "sudo sh -c fuser -k 1080/tcp"
-				}
-				l.AppendLog(fmt.Sprintf("[ERR] If port problem try this command in terminal: '%s'", comm))
-			}
-			finish("Status: Failed", isRunning, l, startEnabled, stopEnabled)
-		} else {
-			l.AppendLog("Client stopped gracefully")
-			// Only call finish if we're still running (not already stopped)
-			if *isRunning {
-				finish("Status: Stopped", isRunning, l, startEnabled, stopEnabled)
-			}
-		}
-	}()
-}
-
-func finish(status string, isRunning *bool, l *logging.LogsContainer, startEnabled, stopEnabled binding.Bool) {
-	*isRunning = false
-	l.StatusBind.Set(status)
-	startEnabled.Set(true)
-	stopEnabled.Set(false)
-	l.AppendLog(fmt.Sprintf("Client status: %s", strings.TrimPrefix(status, "Status: ")))
-}
 
 func CreateAndRun() {
 	myApp := app.NewWithID("com.umbrella.client")
@@ -406,7 +244,7 @@ func CreateAndRun() {
 
 	stopFunc := func() {
 		if cancelFunc != nil {
-			lg.AppendLog("Stopping client...")
+			lg.AppendLog("[INFO] Stopping client...")
 			lg.StatusBind.Set("Status: Stopping...")
 			startEnabled.Set(false)
 			stopEnabled.Set(false)
@@ -472,14 +310,14 @@ func CreateAndRun() {
 
 	stopBtn.OnTapped = stopFunc
 
-	var presetsWin fyne.Window
-	presetsBtn := widget.NewButtonWithIcon("Presets", theme.FileIcon(), func() {
-		if presetsWin != nil {
-			presetsWin.Close()
-		}
-		presetsWin = windows.NewPresetsWindow(myApp, appSettings, lg)
-		presetsWin.Show()
-	})
+	// var presetsWin fyne.Window
+	// presetsBtn := widget.NewButtonWithIcon("Presets", theme.FileIcon(), func() {
+	// 	if presetsWin != nil {
+	// 		presetsWin.Close()
+	// 	}
+	// 	presetsWin = windows.NewPresetsWindow(myApp, appSettings, lg)
+	// 	presetsWin.Show()
+	// })
 
 	var settingsWin fyne.Window
 	settingsBtn := widget.NewButtonWithIcon("Settings", theme.SettingsIcon(), func() {
@@ -493,7 +331,8 @@ func CreateAndRun() {
 	// Layout
 	top := container.NewVBox(
 		statusLabel,
-		container.NewGridWithColumns(4, startBtn, stopBtn, presetsBtn, settingsBtn),
+		// container.NewGridWithColumns(4, startBtn, stopBtn, presetsBtn, settingsBtn),
+		container.NewGridWithColumns(3, startBtn, stopBtn, settingsBtn),
 	)
 	bottom := container.NewGridWithColumns(4, copyBtn, clearBtn, decBtn, incBtn)
 
@@ -507,14 +346,14 @@ func CreateAndRun() {
 	startEnabled.Set(true)
 	stopEnabled.Set(false)
 
-	lg.AppendLog("--- Umbrella Client Ready ---")
+	lg.AppendLog("[INFO] --- Umbrella Client Ready ---")
 	if runtime.GOOS == "android" {
-		lg.AppendLog("Running on Android")
+		lg.AppendLog("[INFO] Running on Android")
 	} else {
-		lg.AppendLog("Running on " + runtime.GOOS)
+		lg.AppendLog("[INFO] Running on " + runtime.GOOS)
 	}
-	lg.AppendLog("Storage: " + appFilesDir)
-	lg.AppendLog("Click 'Start' to begin")
+	lg.AppendLog("[INFO] Storage: " + appFilesDir)
+	lg.AppendLog("[INFO] Click 'Start' to begin")
 
 	// Save settings when window is closed
 	window.SetOnClosed(func() {

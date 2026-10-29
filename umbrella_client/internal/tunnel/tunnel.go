@@ -30,7 +30,7 @@ func StartTunnelCore(path string, args string, logsContainer *logging.LogsContai
 	}
 
 	tunnelCoreProcess := cmd.Process
-	logsContainer.AppendLog("Tunnel core started: " + path)
+	logsContainer.AppendLog("[INFO] Tunnel core started: " + path)
 	return tunnelCoreProcess, nil
 }
 

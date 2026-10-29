@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -13,7 +12,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
 	"umbrella_client/internal/client/bypass"
 	"umbrella_client/internal/client/config"
 	"umbrella_client/internal/client/shaper"
@@ -23,7 +21,6 @@ import (
 var (
 	cfg            *config.Config
 	gServerAddr    string
-	gAuthKey       []byte
 	gListenAddr    string
 	gBypass        []string
 	gShaper        bool
@@ -43,16 +40,8 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 	gListenAddr = cfg.ListenAddr
 	gBypass = make([]string, len(cfg.Bypass))
 	copy(gBypass, cfg.Bypass)
-	isActivated.Store(false)
 
 	var err error
-	if cfg.Xhttp.AuthKey == "" {
-		return fmt.Errorf("auth-key is required")
-	}
-	gAuthKey, err = hex.DecodeString(cfg.Xhttp.AuthKey)
-	if err != nil || len(gAuthKey) != 32 {
-		return fmt.Errorf("invalid auth-key: must be 64 hex chars (32 bytes)")
-	}
 
 	if host, _, err := net.SplitHostPort(gServerAddr); err == nil {
 		gBypass = append(gBypass, host)
@@ -95,14 +84,13 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 		alpn = []string{"h3"}
 	}
 
-	transport := NewTransport(gServerAddr, cfg.SNI, alpn, cfg.Xhttp.AuthKey)
+	transport := NewTransport(gServerAddr, cfg.SNI, alpn)
 
 	// 2. Создаем xhttp.Client
 	gXhttpClient = &Client{
 		ctx:       ctx,
 		host:      cfg.SNI,
 		path:      cfg.Xhttp.Path,
-		authKey:   cfg.Xhttp.AuthKey,
 		mode:      cfg.Xhttp.Mode, // stream-one, stream-up, packet-up
 		transport: transport,
 	}
@@ -126,12 +114,11 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 				return
 			}
 
-			newTransport := NewTransport(gServerAddr, cfg.SNI, alpn, cfg.Xhttp.AuthKey)
+			newTransport := NewTransport(gServerAddr, cfg.SNI, alpn)
 			newXhttpClient := &Client{
 				ctx:       ctx,
 				host:      cfg.SNI,
 				path:      cfg.Xhttp.Path,
-				authKey:   cfg.Xhttp.AuthKey,
 				mode:      cfg.Xhttp.Mode, // stream-one, stream-up, packet-up
 				transport: newTransport,
 			}
@@ -168,24 +155,15 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 		case <-ctx.Done():
 			log.Printf("[INFO] Umbrella/Xhttp client listener closed, stopping")
 			go func() {
-				// 1. Закрываем все активные прокси-сессии
 				tcpSessionsMu.Lock()
-				for _, s := range tcpSessions {
-					if s.tcpConn != nil {
-						s.tcpConn.Close()
-					}
-				}
 				tcpSessions = nil
 				tcpSessionsMu.Unlock()
 
-				// 2. Закрываем основной клиент xhttp
 				gXhttpClientMu.Lock()
 				if gXhttpClient != nil {
-					gXhttpClient.Close()
+					go gXhttpClient.Close()
 				}
 				gXhttpClientMu.Unlock()
-
-				isActivated.Store(false)
 			}()
 			return nil
 		default:
@@ -611,7 +589,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 
 						rn, err := tunnelConn.Read(respBuf[dataOffset:])
 						if err != nil {
-							if err != io.EOF {
+							if err != io.EOF && err.Error() != "H3_REQUEST_CANCELLED (local)" {
 								log.Printf("[ERR] UDP Downlink read error from %s: %v", targetForCleanup, err)
 							}
 							return // Выход приведет к вызову defer removeSession

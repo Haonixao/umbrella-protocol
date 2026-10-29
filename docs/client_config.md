@@ -1,36 +1,31 @@
 # Umbrella Client Configuration Parameters Reference
 
-In the Umbrella GUI client, all settings are defined in internal editors ( **Settings -> Config Editor** and **Phase Editor** ). Below is a detailed description of each parameter.
+In the Umbrella GUI client, all settings are defined in internal editors (**Settings -> Config Editor** and **Phase Editor**). 
+
+**Important Note on Zero-Touch Provisioning:** Most "Server side data" parameters (Protocol, Server, SNI, XHTTP Path, Hysteria Auth-Password, Torrent Auth-Key/Info-Hash) are automatically fetched from the Control Plane (IMAP) upon activation. Manual configuration of these is only required for initial setup, debugging, or offline mode.
 
 ---
 
-### protocol:
+## Client Side Data & Control Plane
+
+### client_activation_key:
 
 ```yaml
-protocol: "xtls"
+client_activation_key: "your_pre_shared_key"
 ```
 
-Defines the main traffic obfuscation protocol.
-* **Allowed values** : `"xtls"`,            `"hysteria"`,            `"torrent"`.
-* **Default** : `"xtls"`.
+The pre-shared key used to authenticate the client's IP address with the server via the Control Plane (IMAP). This is the only mandatory credential required to establish a connection.
 
-### server:
+### imap.gmail.login & imap.gmail.password:
 
 ```yaml
-server: "1.2.3.4:443" # or 1.2.3.4:50000-50100 for torrent
+imap:
+  gmail:
+    login: "your_email@gmail.com"
+    password: "your_app_password"
 ```
 
-Address and port of your remote Umbrella VPS server.
-* **For Torrent** : You can specify a port range (e.g.,            `50000-50100`) if Port Hopping is enabled.
-
-### sni:
-
-```yaml
-sni: "google.com"
-```
-
-Server Name Indication. The domain that the connection will masquerade as. Must be allowed on the server side.
-* **Default** : `"github.com"`.
+Credentials for the Gmail account used to communicate with the server's Control Plane. The client uses this to send activation requests and fetch the latest server configuration.
 
 ### listen:
 
@@ -39,7 +34,7 @@ listen: "0.0.0.0:1080"
 ```
 
 Local address and port where the client will start the SOCKS5 proxy server.
-* **Default** : `"0.0.0.0:1080"`.
+* **Default**: `"0.0.0.0:1080"`.
 
 ### udp:
 
@@ -48,7 +43,7 @@ udp: true
 ```
 
 Enables `UDP ASSOCIATE` support. Required for voice calls, games, and some messengers to work through the proxy.
-* **Default** : `true`.
+* **Default**: `true`.
 
 ### decoy-traffic:
 
@@ -57,7 +52,7 @@ decoy-traffic: false
 ```
 
 Enables the global obfuscation module. The client will simulate regular user activity by performing rare requests to legitimate global resources (Bing, Apple, etc.) directly, blurring IP connection statistics and hiding the fact of connecting to only one server.
-* **Default** : `false`.
+* **Default**: `false`.
 
 ### shaper:
 
@@ -65,8 +60,8 @@ Enables the global obfuscation module. The client will simulate regular user act
 shaper: false
 ```
 
-Activates the Traffic Shaping system. Allows simulating data transfer patterns of various applications. Requires phase configuration in the **Phase Editor** .
-* **Default** : `false`.
+Activates the Traffic Shaping system. Allows simulating data transfer patterns of various applications. Requires phase configuration in the **Phase Editor**.
+* **Default**: `false`.
 
 ### phases-file:
 
@@ -74,8 +69,8 @@ Activates the Traffic Shaping system. Allows simulating data transfer patterns o
 phases-file: "phases.yml"
 ```
 
-Path to the file containing shaper phase descriptions. In the GUI client, it is edited via the **Phase Editor** .
-* **Default** : `"phases.yml"`.
+Path to the file containing shaper phase descriptions. In the GUI client, it is edited via the **Phase Editor**.
+* **Default**: `"phases.yml"`.
 
 ### bypass:
 
@@ -89,16 +84,40 @@ List of IP networks (in CIDR format) or domain names for which connections shoul
 
 ---
 
-## XHTTP Section (HTTP/2 & HTTP/3 Tunnel)
+## Server Side Data (Auto-fetched via Control Plane)
 
-### xhttp.auth-key:
+*Note: These parameters are typically populated automatically after successful IMAP activation. Manual overrides are possible.*
+
+### protocol:
 
 ```yaml
-xhttp:
-  auth-key: "hex_string_32_bytes"
+protocol: "xhttp"
 ```
 
-Secret key for HMAC authentication between client and server. Must be 64 hex characters (32 bytes).
+Defines the main traffic obfuscation protocol.
+* **Allowed values**: `"xhttp"`, `"hysteria"`, `"torrent"`.
+
+### server:
+
+```yaml
+server: "1.2.3.4:443" # or 1.2.3.4:50000-50100 for torrent
+```
+
+Address and port of your remote Umbrella VPS server.
+* **For Torrent**: You can specify a port range (e.g., `50000-50100`) if Port Hopping is enabled.
+
+### sni:
+
+```yaml
+sni: "google.com"
+```
+
+Server Name Indication. The domain that the connection will masquerade as.
+* **Default**: `"github.com"`.
+
+---
+
+## XHTTP Section (HTTP/2 & HTTP/3 Tunnel)
 
 ### xhttp.quic:
 
@@ -108,7 +127,7 @@ xhttp:
 ```
 
 Enables HTTP/3 (QUIC) instead of HTTP/2 as the underlying transport.
-* **Default** : `false`.
+* **Default**: `false`.
 
 ### xhttp.path:
 
@@ -127,61 +146,14 @@ xhttp:
 ```
 
 Defines the tunneling mode:
-* **stream-one** : A single long-lived POST request for both uplink and downlink.
-* **stream-up** : Uses a GET request for downlink and a separate long-lived POST for uplink.
-* **packet-up** : Uses a GET request for downlink and splits uplink data into multiple small POST requests (useful for bypassing CDN or firewall restrictions).
-* **Default** : `"stream-one"`.
-
-### xtls.public-key:
-
-```yaml
-xtls:
-  public-key: "YOUR_PUBLIC_KEY"
-```
-
-Server's public key for Reality technology. Generated by the server on its first run.
-
-### xtls.short-id:
-
-```yaml
-xtls:
-  short-id: "hex_string"
-```
-
-Reality session identifier. Must strictly match the settings on the server.
-
-### xtls.sessions-num:
-
-```yaml
-xtls:
-  sessions-num: 2
-```
-
-Number of parallel TCP/TLS connections in the multiplexing pool. Increasing this may help on unstable networks or to boost multi-threaded download speeds.
-* **Default** : `2`.
-
-### xtls.connections-time-out:
-
-```yaml
-xtls:
-  connections-time-out: 70
-```
-
-Timeout in seconds after which an inactive connection in the pool will be closed and replaced with a new one.
-* **Default** : `70`.
+* **stream-one**: A single long-lived POST request for both uplink and downlink.
+* **stream-up**: Uses a GET request for downlink and a separate long-lived POST for uplink.
+* **packet-up**: Uses a GET request for downlink and splits uplink data into multiple small POST requests (useful for bypassing CDN or firewall restrictions).
+* **Default**: `"stream-one"`.
 
 ---
 
 ## Hysteria Section (Hysteria 2)
-
-### hysteria.auth-key:
-
-```yaml
-hysteria:
-  auth-key: "hex_string_32_bytes"
-```
-
-Secret key for Umbrella HMAC authentication. Used to obfuscate Connection ID and provide transparent proxying for unauthorized requests.
 
 ### hysteria.auth-password:
 
@@ -190,7 +162,7 @@ hysteria:
   auth-password: "your_password"
 ```
 
-Password for standard Hysteria 2 protocol authentication.
+Password for standard Hysteria 2 protocol authentication. Verified by the internal Hysteria core *after* the frontend wrapper has validated the client's IP via the Control Plane.
 
 ### hysteria.conns-num:
 
@@ -200,7 +172,7 @@ hysteria:
 ```
 
 Number of independent UDP clients (sessions). Helps bypass some provider restrictions on traffic volume or packet count within a single UDP stream.
-* **Default** : `2`.
+* **Default**: `2`.
 
 ---
 
@@ -213,7 +185,8 @@ torrent:
   auth-key: "hex_string_32_bytes"
 ```
 
-Key for HMAC PeerID verification during the BitTorrent handshake. Provides security and obfuscation.
+Shared secret used to derive the AES-CTR session encryption key. 
+* **Note**: This is **no longer** used for HMAC PeerID verification in the handshake (the handshake is now 100% vanilla). It is strictly used for encrypting the payload after the IP has been whitelisted.
 
 ### torrent.info-hash:
 
@@ -223,7 +196,7 @@ torrent:
 ```
 
 Info-hash of the torrent distribution that the traffic masquerades as.
-* **Recommendation** : Use a real hash of popular distributions (e.g., Linux distros) so that masquerading as "White Noise" (tracker requests) looks as plausible as possible.
+* **Recommendation**: Use a real hash of popular distributions (e.g., Linux distros) so that masquerading as "White Noise" (tracker requests) looks as plausible as possible.
 
 ### torrent.sessions-num:
 
@@ -233,7 +206,7 @@ torrent:
 ```
 
 Number of uTP sessions in the Yamux multiplexing pool.
-* **Default** : `2`.
+* **Default**: `2`.
 
 ### torrent.connections-time-out:
 
@@ -243,4 +216,4 @@ torrent:
 ```
 
 Torrent connection rotation period in seconds. Allows changing ports and PeerID to improve obfuscation.
-* **Default** : `70`.
+* **Default**: `70`.

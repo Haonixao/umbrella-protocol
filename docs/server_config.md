@@ -1,18 +1,17 @@
 # Umbrella Server Configuration Parameters Reference
 
-The Umbrella server is managed via the `config.yaml` file, which is automatically generated on the first run with default settings for the XTLS protocol. Below is a detailed description of all available parameters.
+The Umbrella server is managed via the `config.yaml` file, which is automatically generated on the first run with default settings for the XHTTP protocol. Below is a detailed description of all available parameters, reflecting the current architecture with out-of-band (IMAP) activation.
 
 ---
 
 ### protocol:
 
 ```yaml
-protocol: "xtls"
+protocol: "xhttp"
 ```
 
 Defines the active obfuscation protocol on the server.
-* **Allowed values** : `"xtls"`,   `"hysteria"`,   `"torrent"`,   `"xhttp"`.
-* **Default** : `"xtls"`.
+* **Allowed values**: `"xhttp"`, `"hysteria"`, `"torrent"`.
 
 ### port:
 
@@ -21,8 +20,8 @@ port: "443" # or "50000-50100" for torrent
 ```
 
 The port the server will listen on.
-* **For Torrent** : You can specify a port range (e.g.,   `"50000-50100"`) if Port Hopping is enabled.
-* **Default** : `"443"`.
+* **For Torrent**: You can specify a port range (e.g., `"50000-50100"`) to enable Port Hopping.
+* **Default**: `"443"`.
 
 ### dest:
 
@@ -30,8 +29,8 @@ The port the server will listen on.
 dest: "samsung.com:443"
 ```
 
-Fallback address. All incoming connections that fail authorization (without a valid Connection ID, Short ID, or PeerID) will be transparently redirected to this address. This simulates the behavior of a real service.
-* **Default** : `"samsung.com:443"`.
+Fallback address. All incoming connections from unactivated IPs will be transparently redirected to this address. This simulates the behavior of a real service (Reality-like fallback).
+* **Default**: `"samsung.com:443"`.
 
 ### debug:
 
@@ -39,21 +38,37 @@ Fallback address. All incoming connections that fail authorization (without a va
 debug: false
 ```
 
-Enables extended logging of all events and errors to the server console.
-* **Default** : `false`.
+Enables verbose logging for troubleshooting.
+
+---
+
+## IMAP Section (Control Plane)
+
+This section configures the out-of-band channel used for client activation and dynamic configuration delivery.
+
+### imap.gmail.login:
+
+```yaml
+imap:
+  gmail:
+    login: "your_email@gmail.com"
+```
+
+The Gmail account used to read activation requests and publish the server configuration.
+
+### imap.gmail.password:
+
+```yaml
+imap:
+  gmail:
+    password: "your_app_password"
+```
+
+The App Password for the Gmail account (not your regular password). Required for IMAP authentication.
 
 ---
 
 ## XHTTP Section (HTTP/2 & HTTP/3 Tunnel)
-
-### xhttp.auth-key:
-
-```yaml
-xhttp:
-  auth-key: "hex_string_32_bytes"
-```
-
-Secret key for HMAC authentication between client and server. If the client provides an invalid authentication token, the server redirects the request to the `dest` address.
 
 ### xhttp.path:
 
@@ -62,61 +77,12 @@ xhttp:
   path: "/api/v1/update"
 ```
 
-The HTTP path used for the tunnel. Requests to other paths will be handled according to the `dest` fallback logic.
-
----
-
-## XTLS Section (Reality + Vision)
-
-### xtls.private-key:
-
-```yaml
-xtls:
-  private-key: "YOUR_PRIVATE_KEY"
-```
-
-The x25519 private key for Reality technology. Generated automatically on the first run.
-
-### xtls.short-id:
-
-```yaml
-xtls:
-  short-id: "hex_string"
-```
-
-The allowed Short ID. Must match the client settings. Generated automatically on the first run.
-
-### xtls.server-names:
-
-```yaml
-xtls:
-  server-names: "samsung.com,google.com"
-```
-
-A list of domains (SNI) for which the server will issue Reality certificates. By default, it is taken from the `dest` parameter.
+The HTTP path used for the tunnel. Requests to other paths will be handled according to the `dest` fallback logic (returning 404/403 as appropriate).
+* **Note**: `auth-key` has been removed from XHTTP configuration. Authentication is now handled exclusively via IP whitelisting through the IMAP Control Plane.
 
 ---
 
 ## Hysteria Section (Hysteria 2)
-
-### hysteria.quic-port:
-
-```yaml
-hysteria:
-  quic-port: "8443"
-```
-
-The internal UDP port where the Hysteria core operates. The external port is defined by the global `port` parameter.
-* **Default** : `"8443"`.
-
-### hysteria.auth-key:
-
-```yaml
-hysteria:
-  auth-key: "hex_string_32_bytes"
-```
-
-The key for HMAC Connection ID verification. If a client sends an invalid ID, the server redirects the traffic to `dest` .
 
 ### hysteria.auth-password:
 
@@ -125,7 +91,8 @@ hysteria:
   auth-password: "your_password"
 ```
 
-The password for standard Hysteria 2 protocol authentication.
+The password for standard Hysteria 2 protocol authentication. This is verified by the internal Hysteria core *after* the frontend wrapper has validated the client's IP via the Control Plane.
+* **Note**: `auth-key` and `quic-port` have been removed from the configuration. The internal port is fixed (e.g., `8443`), and handshake cryptography is no longer used for initial filtering.
 
 ---
 
@@ -138,7 +105,8 @@ torrent:
   auth-key: "hex_string_32_bytes"
 ```
 
-The key for HMAC PeerID verification. Allows distinguishing "authorized" clients from random scanners or real torrent network participants.
+The shared secret used to derive the AES-CTR session encryption key. 
+* **Note**: This is no longer used for HMAC PeerID verification in the handshake. The handshake is now 100% vanilla. This key is only used for encrypting the payload after the IP has been whitelisted.
 
 ### torrent.info-hash:
 
@@ -148,4 +116,4 @@ torrent:
 ```
 
 The info-hash of the torrent distribution. If left empty, the server will generate a random hash at startup.
-* **Recommendation** : Specify a real hash (e.g., a Linux distribution) so the server appears as a legitimate peer for that distribution.
+* **Recommendation**: Specify a real hash (e.g., a popular Linux distribution) so the server appears as a legitimate peer for that distribution during Decoy Mode.

@@ -2,11 +2,10 @@ package torrent
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -19,7 +18,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"umbrella_server/internal/activator"
 	"umbrella_server/internal/config"
+	"umbrella_server/pkg/ip"
 
 	"github.com/anacrolix/utp"
 	"github.com/hashicorp/yamux"
@@ -36,10 +38,11 @@ const (
 )
 
 var (
-	gAuthKey    []byte
-	gInfoHash   [20]byte
-	copyBufPool = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
-	udpBufPool  = sync.Pool{New: func() any { b := make([]byte, 66*1024); return &b }}
+	gAuthKey     []byte
+	gInfoHash    [20]byte
+	gInfoHashSet bool
+	copyBufPool  = sync.Pool{New: func() any { b := make([]byte, 32*1024); return &b }}
+	udpBufPool   = sync.Pool{New: func() any { b := make([]byte, 66*1024); return &b }}
 )
 
 func TorrentStarter(cfg *config.Config) {
@@ -58,6 +61,29 @@ func TorrentStarter(cfg *config.Config) {
 			log.Fatalf("[ERR] invalid torrent info-hash: must be 40 hex chars (20 bytes)")
 		}
 		copy(gInfoHash[:], ih)
+		gInfoHashSet = true
+	}
+
+	serverIp, err := ip.CheckIp()
+	if err != nil {
+		log.Fatalf("[ERR] ip check error: %v", err)
+	}
+
+	clientCfg := config.ClientConfig{
+		Protocol: cfg.Protocol,
+		Server:   serverIp + ":" + cfg.Port,
+		Torrent: struct {
+			AuthKey  string "yaml:\"auth-key\""
+			InfoHash string "yaml:\"info-hash\""
+		}{
+			AuthKey:  cfg.Torrent.AuthKey,
+			InfoHash: cfg.Torrent.InfoHash,
+		},
+	}
+
+	ac, err := activator.SetupActivator(*cfg, clientCfg)
+	if err != nil {
+		log.Fatalf("[ERR] setup activator: %v", err)
 	}
 
 	host, portStr, err := net.SplitHostPort(cfg.Port)
@@ -92,7 +118,7 @@ func TorrentStarter(cfg *config.Config) {
 				if err != nil {
 					continue
 				}
-				go handleTorrentConn(conn)
+				go handleTorrentConn(conn, ac)
 			}
 		}(p)
 	}
@@ -100,7 +126,7 @@ func TorrentStarter(cfg *config.Config) {
 	select {}
 }
 
-func handleTorrentConn(conn net.Conn) {
+func handleTorrentConn(conn net.Conn, ac *activator.Activator) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Panic] handleTorrentConn from %s: %v", conn.RemoteAddr(), r)
@@ -108,6 +134,7 @@ func handleTorrentConn(conn net.Conn) {
 		conn.Close()
 	}()
 	log.Printf("[INFO] Incoming connection from %s", conn.RemoteAddr())
+
 	// 1. Read BitTorrent Handshake
 	handshake := make([]byte, handshakeLen)
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -121,65 +148,40 @@ func handleTorrentConn(conn net.Conn) {
 	}
 
 	clientInfoHash := handshake[28:48]
-	peerID := handshake[48:68] // Последние 20 байт
+	clientPeerID := make([]byte, 20)
+	copy(clientPeerID, handshake[48:68])
 
-	// --- НОВАЯ ЛОГИКА АВТОРИЗАЦИИ ---
-
-	// 1. Извлекаем компоненты из PeerID
-	// [0:8]   = "-TR4000-" (статический префикс)
-	// [8:12]  = Rnd (4 байта)
-	// [12:15] = MaskedTime (3 байта)
-	// [15:20] = Signature (5 байт)
-
-	rnd := peerID[8:12]
-	maskedTime := peerID[12:15]
-	signature := peerID[15:20]
-
-	// 2. Снимаем маску XOR с времени, используя rnd
-	minBytes := make([]byte, 3)
-	for i := 0; i < 3; i++ {
-		minBytes[i] = maskedTime[i] ^ rnd[i]
-	}
-
-	// 3. Проверяем временное окно (UTC)
-	minutesSinceYearStart := uint32(minBytes[0])<<16 | uint32(minBytes[1])<<8 | uint32(minBytes[2])
-	now := time.Now().UTC()
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	clientTime := yearStart.Add(time.Duration(minutesSinceYearStart) * time.Minute)
-
-	// Окно ± 2.5 минуты
-	if now.Sub(clientTime).Abs() > 2*time.Minute+30*time.Second {
-		log.Printf("[INFO] Decoy: time drift too high from %s", conn.RemoteAddr())
+	host, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+	if !ac.IsIpActivated(host) {
 		beRealTorrentPeer(conn, clientInfoHash)
 		return
 	}
 
-	// 4. Проверяем подпись HMAC (rnd + real_minutes + infohash)
-	mac := hmac.New(sha1.New, gAuthKey)
-	mac.Write(rnd)
-	mac.Write(minBytes)
-	mac.Write(clientInfoHash)
-	expectedSig := mac.Sum(nil)[:5]
-
-	if hmac.Equal(signature, expectedSig) {
-		// Успешная авторизация
-		respHandshake := make([]byte, handshakeLen)
-		respHandshake[0] = pstrlen
-		copy(respHandshake[1:20], pstr)
-		copy(respHandshake[28:48], clientInfoHash)
-		copy(respHandshake[48:56], []byte("-UM1000-"))
-		rand.Read(respHandshake[56:68])
-		conn.Write(respHandshake)
-
-		// Передаем rnd в качестве nonce для инициализации AES-CTR
-		handleUmbrellaSess(conn, rnd)
-	} else {
-		// Неверная подпись — уходим в режим приманки
+	// 2. If info_hash filter is configured, reject non-matching connections
+	if gInfoHashSet && !bytes.Equal(clientInfoHash, gInfoHash[:]) {
 		beRealTorrentPeer(conn, clientInfoHash)
+		return
 	}
+
+	// 3. Send response handshake with random peer_id (default BitTorrent behavior)
+	serverPeerID := make([]byte, 20)
+	copy(serverPeerID[:8], []byte("-TR4000-"))
+	rand.Read(serverPeerID[8:20])
+
+	respHandshake := make([]byte, handshakeLen)
+	respHandshake[0] = pstrlen
+	copy(respHandshake[1:20], pstr)
+	copy(respHandshake[28:48], clientInfoHash)
+	copy(respHandshake[48:68], serverPeerID)
+	if _, err := conn.Write(respHandshake); err != nil {
+		return
+	}
+
+	// 4. Start encrypted Umbrella session
+	handleUmbrellaSess(conn, clientPeerID, serverPeerID)
 }
 
-func handleUmbrellaSess(conn net.Conn, nonce []byte) {
+func handleUmbrellaSess(conn net.Conn, clientPeerID, serverPeerID []byte) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[Panic] handleUmbrellaSess from %s: %v", conn.RemoteAddr(), r)
@@ -199,7 +201,7 @@ func handleUmbrellaSess(conn net.Conn, nonce []byte) {
 	conn.Write(bf)
 	conn.Write([]byte{0, 0, 0, 1, unchokeMsgID})
 
-	tConn := NewTorrentConn(conn, gAuthKey, gInfoHash, nonce)
+	tConn := NewTorrentConn(conn, gAuthKey, clientPeerID, serverPeerID)
 	muxCfg := yamux.DefaultConfig()
 	muxCfg.MaxStreamWindowSize = 8 * 1024 * 1024
 	muxCfg.EnableKeepAlive = true
@@ -505,7 +507,7 @@ func beRealTorrentPeer(conn net.Conn, infoHash []byte) {
 	respHandshake[0] = pstrlen
 	copy(respHandshake[1:20], pstr)
 	copy(respHandshake[28:48], infoHash)
-	copy(respHandshake[48:56], []byte("-TR3000-"))
+	copy(respHandshake[48:56], []byte("-TR4000-"))
 	rand.Read(respHandshake[56:68])
 	if _, err := conn.Write(respHandshake); err != nil {
 		return
@@ -567,13 +569,13 @@ type TorrentConn struct {
 	dec              cipher.Stream
 }
 
-func NewTorrentConn(conn net.Conn, authKey []byte, infoHash [20]byte, nonce []byte) *TorrentConn {
+func NewTorrentConn(conn net.Conn, authKey []byte, clientPeerID, serverPeerID []byte) *TorrentConn {
 	tc := &TorrentConn{
 		Conn:   conn,
 		reader: bufio.NewReaderSize(conn, 256*1024),
 	}
 	key := sha256.Sum256(authKey)
-	ivSeed := append(nonce, infoHash[:]...)
+	ivSeed := append(append(append([]byte{}, authKey...), clientPeerID...), serverPeerID...)
 	iv := sha256.Sum256(ivSeed)
 	block, err := aes.NewCipher(key[:])
 	if err == nil {

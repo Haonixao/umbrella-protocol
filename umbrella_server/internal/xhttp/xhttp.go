@@ -90,7 +90,6 @@ func (s *httpSession) markConnected() {
 type server struct {
 	tr               *http.Transport
 	sni              string
-	filter           *allowedIPFilter
 	authKey          []byte
 	mu               sync.Mutex
 	sessions         map[string]*httpSession

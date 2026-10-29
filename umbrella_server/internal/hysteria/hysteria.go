@@ -1,10 +1,8 @@
 package hysteria
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha512"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -14,7 +12,10 @@ import (
 	"net"
 	"sync"
 	"time"
+
+	"umbrella_server/internal/activator"
 	"umbrella_server/internal/config"
+	"umbrella_server/pkg/ip"
 
 	"github.com/apernet/hysteria/core/v2/server"
 	"github.com/apernet/hysteria/extras/v2/auth"
@@ -26,7 +27,6 @@ type session struct {
 }
 
 var (
-	authKey     []byte
 	cfg         *config.Config
 	sessions    = make(map[string]*session)
 	sessionsMu  sync.RWMutex
@@ -34,26 +34,11 @@ var (
 	hysteriaSrv server.Server
 	cachedCert  *tls.Certificate
 	certOnce    sync.Once
+	quicPort    = "8443"
 )
 
 func HysteriaStarter(c *config.Config) {
 	cfg = c
-	log.Printf("[INFO] Umbrella/Hysteria server on :%s (fallback → %s)", cfg.Port, cfg.Dest)
-	log.Printf("[INFO] QUIC port: %s", cfg.Hysteria.QuicPort)
-
-	if cfg.Hysteria.AuthKey == "" {
-		authKey = make([]byte, 32)
-		if _, err := rand.Read(authKey); err != nil {
-			log.Fatalf("[ERR] generate auth key: %v", err)
-		}
-		log.Printf("[INFO] Generated auth-key — save this for client: %s", hex.EncodeToString(authKey))
-	} else {
-		var err error
-		authKey, err = hex.DecodeString(cfg.Hysteria.AuthKey)
-		if err != nil || len(authKey) != 32 {
-			log.Fatalf("[ERR] auth-key must be 32 bytes (64 hex chars)")
-		}
-	}
 
 	if cfg.Hysteria.AuthPassword == "" {
 		cfg.Hysteria.AuthPassword = generatePassword()
@@ -61,18 +46,41 @@ func HysteriaStarter(c *config.Config) {
 	}
 
 	log.Printf("[INFO] Auth password: %s", cfg.Hysteria.AuthPassword)
-	log.Printf("[INFO] Auth key: %s", cfg.Hysteria.AuthKey)
+
+	serverIp, err := ip.CheckIp()
+	if err != nil {
+		log.Fatalf("[ERR] ip check error: %v", err)
+	}
+
+	sni, _, err := net.SplitHostPort(cfg.Dest)
+	if err != nil {
+		log.Fatalf("[ERR] get sni from dest: %v", err)
+	}
+
+	clientCfg := config.ClientConfig{
+		Protocol: cfg.Protocol,
+		Server:   serverIp + ":" + cfg.Port,
+		SNI:      sni,
+		Hysteria: struct {
+			AuthPassword string "yaml:\"auth-password\""
+		}{
+			AuthPassword: cfg.Hysteria.AuthPassword,
+		},
+	}
+
+	ac, err := activator.SetupActivator(*cfg, clientCfg)
+	if err != nil {
+		log.Fatalf("[ERR] setup activator: %v", err)
+	}
 
 	go startHysteriaServer()
-	startFrontend()
+
+	log.Printf("[INFO] Umbrella/Hysteria server on :%s (fallback → %s)", cfg.Port, cfg.Dest)
+
+	startFrontend(ac)
 }
 
 func startHysteriaServer() {
-	quicPort := cfg.Hysteria.QuicPort
-	if quicPort == "" {
-		quicPort = "8443"
-	}
-
 	addr, err := net.ResolveUDPAddr("udp", ":"+quicPort)
 	if err != nil {
 		log.Fatalf("[ERR] resolve hysteria addr: %v", err)
@@ -155,7 +163,7 @@ func generatePassword() string {
 	return hex.EncodeToString(b)
 }
 
-func startFrontend() {
+func startFrontend(ac *activator.Activator) {
 	addr, err := net.ResolveUDPAddr("udp", ":"+cfg.Port)
 	if err != nil {
 		log.Fatalf("[ERR] resolve frontend addr: %v", err)
@@ -186,7 +194,7 @@ func startFrontend() {
 
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
-		go handlePacket(packet, clientAddr)
+		go handlePacket(packet, clientAddr, ac)
 	}
 }
 
@@ -194,13 +202,7 @@ func sessionKey(addr *net.UDPAddr) string {
 	return addr.String()
 }
 
-func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
-	if len(packet) < 6 {
-		return
-	}
-
-	isInitial := (packet[0]&0xC0 == 0xC0) && ((packet[0]>>4)&0x03 == 0x00)
-
+func handlePacket(packet []byte, clientAddr *net.UDPAddr, ac *activator.Activator) {
 	sessionsMu.RLock()
 	sess := sessions[sessionKey(clientAddr)]
 	sessionsMu.RUnlock()
@@ -212,64 +214,10 @@ func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
 		return
 	}
 
-	if !isInitial {
+	if ac.IsIpActivated(clientAddr.IP.String()) {
+		log.Printf("[INFO] Valid Hysteria client, forwarding → %s", clientAddr.IP.String())
+		forwardToHysteria(packet, clientAddr)
 		return
-	}
-
-	dcidLen := int(packet[5])
-	if len(packet) < 6+dcidLen {
-		return
-	}
-
-	scidStart := 6 + dcidLen
-	if len(packet) < scidStart+1 {
-		return
-	}
-	scidLen := int(packet[scidStart])
-	scidStart++
-
-	if len(packet) < scidStart+scidLen {
-		return
-	}
-
-	scid := packet[scidStart : scidStart+scidLen]
-
-	if len(scid) == 20 {
-		rnd := scid[0:5]
-		maskedTime := scid[5:8]
-		receivedSig := scid[8:20]
-
-		// 1. Восстанавливаем время через XOR
-		minBytes := make([]byte, 3)
-		for i := 0; i < 3; i++ {
-			minBytes[i] = maskedTime[i] ^ rnd[i]
-		}
-
-		// 2. Проверяем временное окно (± 2.5 минуты)
-		minutes := uint32(minBytes[0])<<16 | uint32(minBytes[1])<<8 | uint32(minBytes[2])
-		now := time.Now().UTC()
-		yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-		clientTime := yearStart.Add(time.Duration(minutes) * time.Minute)
-
-		if now.Sub(clientTime).Abs() > 2*time.Minute+30*time.Second {
-			log.Printf("[INFO] Decoy: Hysteria CID time drift too high from %s", clientAddr.IP.String())
-			forwardToDest(packet, clientAddr)
-			return
-		}
-
-		// 3. Проверяем HMAC
-		mac := hmac.New(sha512.New, authKey)
-		mac.Write(rnd)
-		mac.Write(minBytes)
-		expectedSig := mac.Sum(nil)[:12]
-
-		if hmac.Equal(receivedSig, expectedSig) {
-			log.Printf("[INFO] Valid Hysteria client (Time+HMAC), forwarding → %s", clientAddr.IP.String())
-			forwardToHysteria(packet, clientAddr)
-			return
-		}
-	} else if len(scid) > 0 {
-		log.Printf("[ERR] Unexpected SCID length: %d from %s", len(scid), clientAddr.IP.String())
 	}
 
 	log.Printf("[INFO] Unknown client, forwarding to dest → %s", clientAddr.IP.String())
@@ -277,10 +225,6 @@ func handlePacket(packet []byte, clientAddr *net.UDPAddr) {
 }
 
 func forwardToHysteria(packet []byte, clientAddr *net.UDPAddr) *session {
-	quicPort := cfg.Hysteria.QuicPort
-	if quicPort == "" {
-		quicPort = "8443"
-	}
 	backendAddr, err := net.ResolveUDPAddr("udp", ":"+quicPort)
 	if err != nil {
 		log.Printf("[ERR] resolve hysteria addr: %v", err)

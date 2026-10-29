@@ -3,14 +3,15 @@ package xhttp
 import (
 	"context"
 	"crypto/tls"
-	"encoding/hex"
 	"log"
 	"math/rand"
 	"net"
 	"net/http"
 	"time"
 
+	"umbrella_server/internal/activator"
 	"umbrella_server/internal/config"
+	"umbrella_server/pkg/ip"
 
 	"github.com/apernet/hysteria/core/v2/congestion"
 	"github.com/apernet/hysteria/core/v2/congestion/bbr"
@@ -23,23 +24,35 @@ func XhttpStarter(cfg *config.Config) {
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	log.Printf("[INFO] Umbrella/Xhttp server on :%s (fallback → %s)", cfg.Port, cfg.Dest)
 
-	var authKey []byte
-
-	if cfg.Xhttp.AuthKey == "" {
-		authKey = make([]byte, 32)
-		if _, err := rand.Read(authKey); err != nil {
-			log.Fatalf("[ERR] generate auth key: %v", err)
-		}
-		log.Printf("[INFO] Generated auth-key — save this for client: %s", hex.EncodeToString(authKey))
-	} else {
-		var err error
-		authKey, err = hex.DecodeString(cfg.Xhttp.AuthKey)
-		if err != nil || len(authKey) != 32 {
-			log.Fatalf("[ERR] auth-key must be 32 bytes (64 hex chars)")
-		}
+	serverIp, err := ip.CheckIp()
+	if err != nil {
+		log.Fatalf("[ERR] ip check error: %v", err)
 	}
 
-	filter := &allowedIPFilter{allowed: make(map[string]bool)}
+	sni, _, err := net.SplitHostPort(cfg.Dest)
+	if err != nil {
+		log.Fatalf("[ERR] get sni from dest: %v", err)
+	}
+
+	clientCfg := config.ClientConfig{
+		Protocol: cfg.Protocol,
+		Server:   serverIp + ":" + cfg.Port,
+		SNI:      sni,
+		Xhttp: struct {
+			Quic bool   "yaml:\"quic\""
+			Path string "yaml:\"path\""
+			Mode string "yaml:\"mode\""
+		}{
+			Quic: false,
+			Path: cfg.Xhttp.Path,
+			Mode: "stream-one",
+		},
+	}
+
+	ac, err := activator.SetupActivator(*cfg, clientCfg)
+	if err != nil {
+		log.Fatalf("[ERR] setup activator: %v", err)
+	}
 
 	certPEM, keyPEM, err := GenCertInMemory(cfg.Dest)
 	if err != nil {
@@ -67,10 +80,9 @@ func XhttpStarter(cfg *config.Config) {
 	}
 
 	f := &ipFilterListener{
-		inner:   l,
-		filter:  filter,
-		dest:    cfg.Dest,
-		authKey: authKey,
+		inner: l,
+		dest:  cfg.Dest,
+		ac:    ac,
 	}
 
 	// Инициализируем http.Transport
@@ -96,8 +108,6 @@ func XhttpStarter(cfg *config.Config) {
 	s := &server{
 		tr:               tr,
 		sni:              cfg.Dest,
-		filter:           filter,
-		authKey:          authKey,
 		sessions:         map[string]*httpSession{},
 		secretPath:       cfg.Xhttp.Path,
 		xPaddingRange:    Range{Min: 32, Max: 512},
@@ -128,12 +138,11 @@ func XhttpStarter(cfg *config.Config) {
 	}
 
 	q := &quicFrontend{
-		filter:      filter,
 		dest:        cfg.Dest,
 		backend:     "127.0.0.1:8443",
-		authKey:     authKey,
 		sessions:    map[string]*udpSession{},
 		sessionWait: make(map[string]chan struct{}),
+		ac:          ac,
 	}
 	go q.Start(":" + cfg.Port)
 
@@ -167,7 +176,7 @@ func XhttpStarter(cfg *config.Config) {
 			DisablePathManager: true,
 		},
 		ConnContext: func(ctx context.Context, conn *quic.Conn) context.Context {
-			congestion.UseBBR(conn, bbr.Profile("aggressive"))
+			congestion.UseBBR(conn, bbr.ProfileAggressive)
 			return ctx
 		},
 	}

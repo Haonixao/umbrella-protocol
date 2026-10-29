@@ -8,7 +8,6 @@ import (
 	"umbrella_server/internal/hysteria"
 	"umbrella_server/internal/torrent"
 	"umbrella_server/internal/xhttp"
-	"umbrella_server/internal/xtls"
 )
 
 func main() {
@@ -21,8 +20,6 @@ func main() {
 	}
 
 	switch cfg.Protocol {
-	case "xtls":
-		xtls.XtlsStarter(cfg)
 	case "hysteria":
 		hysteria.HysteriaStarter(cfg)
 	case "torrent":

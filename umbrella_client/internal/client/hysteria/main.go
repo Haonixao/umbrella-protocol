@@ -2,11 +2,8 @@ package hysteria
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha512"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -16,66 +13,17 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
 	"umbrella_client/internal/client/bypass"
 	"umbrella_client/internal/client/config"
 	"umbrella_client/internal/client/shaper"
 	"umbrella_client/internal/client/share"
 
 	"github.com/apernet/hysteria/core/v2/client"
-	"github.com/apernet/quic-go"
 )
-
-type customCIDGenerator struct {
-	authKey []byte
-}
-
-func (g *customCIDGenerator) GenerateConnectionID() (quic.ConnectionID, error) {
-	rnd := make([]byte, 5)
-	if _, err := rand.Read(rnd); err != nil {
-		return quic.ConnectionID{}, err
-	}
-
-	// Получаем минуты с начала года
-	now := time.Now().UTC()
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	minutes := uint32(now.Sub(yearStart).Minutes())
-
-	minBytes := make([]byte, 3)
-	minBytes[0] = byte(minutes >> 16)
-	minBytes[1] = byte(minutes >> 8)
-	minBytes[2] = byte(minutes)
-
-	// Зашумляем время через XOR с rnd
-	maskedTime := make([]byte, 3)
-	for i := 0; i < 3; i++ {
-		maskedTime[i] = minBytes[i] ^ rnd[i]
-	}
-
-	// HMAC от Rnd + Real Minutes
-	mac := hmac.New(sha512.New, g.authKey)
-	mac.Write(rnd)
-	mac.Write(minBytes)
-	signature := mac.Sum(nil)[:12] // 12 байт подписи
-
-	// Собираем CID: [Rnd:5][MaskedTime:3][Signature:12] = 20 байт
-	cid := make([]byte, 20)
-	copy(cid[0:5], rnd)
-	copy(cid[5:8], maskedTime)
-	copy(cid[8:20], signature)
-
-	return quic.ConnectionIDFromBytes(cid), nil
-}
-
-func (g *customCIDGenerator) ConnectionIDLen() int {
-	// quic-go использует это как подсказку для максимальной длины.
-	return 20
-}
 
 var (
 	cfg              *config.Config
 	gServerAddr      string
-	gAuthKey         []byte
 	gListenAddr      string
 	gBypass          []string
 	gShaper          bool
@@ -104,13 +52,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 	copy(gBypass, cfg.Bypass)
 
 	var err error
-	if cfg.Hysteria.AuthKey == "" {
-		return fmt.Errorf("auth-key is required for hysteria protocol")
-	}
-	gAuthKey, err = hex.DecodeString(cfg.Hysteria.AuthKey)
-	if err != nil || len(gAuthKey) != 32 {
-		return fmt.Errorf("invalid auth-key: must be 64 hex chars (32 bytes)")
-	}
 
 	if host, _, err := net.SplitHostPort(gServerAddr); err == nil {
 		gBypass = append(gBypass, host)
@@ -162,11 +103,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 			log.Printf("[INFO] Umbrella/Hysteria client listener closed, stopping")
 			go func() {
 				tcpSessionsMu.Lock()
-				for _, s := range tcpSessions {
-					if s.tcpConn != nil {
-						s.tcpConn.Close()
-					}
-				}
 				tcpSessions = nil
 				tcpSessionsMu.Unlock()
 
@@ -193,9 +129,6 @@ func Start(c *config.Config, ctx context.Context, appFilesDir string) error {
 		}
 		go handleSOCKS5(ctx, conn)
 	}
-}
-
-func listenSOCKS5(ctx context.Context) {
 }
 
 func handleSOCKS5(ctx context.Context, conn net.Conn) {
@@ -317,9 +250,7 @@ func establishHyClient(idx int, ctx context.Context) (client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	cidGen := &customCIDGenerator{authKey: gAuthKey}
-	hyClient, _, err := client.NewClientWithConnectionIDGenerator(&client.Config{
+	hyClient, _, err := client.NewClient(&client.Config{
 		ConnFactory: connFactory,
 		ServerAddr:  serverAddr,
 		Auth:        cfg.Hysteria.AuthPassword,
@@ -327,7 +258,7 @@ func establishHyClient(idx int, ctx context.Context) (client.Client, error) {
 			ServerName:         cfg.SNI,
 			InsecureSkipVerify: true,
 		},
-	}, cidGen)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +438,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 				for target, sess := range sessions {
 					if time.Since(sess.lastActive) > 60*time.Second {
 						log.Printf("[INFO] Closing idle Hysteria UDP session for %s", target)
-						sess.hyConn.Close()
+						go sess.hyConn.Close()
 						delete(sessions, target)
 					}
 				}
@@ -604,7 +535,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 				sess.lastActive = time.Now()
 				if err := sess.hyConn.Send(buf[dataStart:n], targetAddr); err != nil {
 					log.Printf("[ERR] Cached Hysteria UDP send failed: %v", err)
-					sess.hyConn.Close()
+					go sess.hyConn.Close()
 					delete(sessions, targetAddr)
 					ok = false
 				}
@@ -638,7 +569,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 						sessionsMu.Unlock()
 					}()
 
-					for attempt := 0; attempt < 3; attempt++ {
+					for range 3 {
 						hyClient, err := getHyClientFromPool(ctx)
 						if err != nil {
 							log.Printf("[ERR] get hyClient from pool: %v", err)
@@ -651,7 +582,7 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 						}
 						if err := hyConn.Send(data, t); err != nil {
 							log.Printf("[ERR] failed udp send to %s: %v", targetAddr, err)
-							hyConn.Close()
+							go hyConn.Close()
 							continue
 						}
 
@@ -668,7 +599,9 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 							for {
 								resp, from, err := hyConn.Receive()
 								if err != nil {
-									log.Printf("[ERR] failed udp receive: %v", err)
+									if err.Error() != "EOF" {
+										log.Printf("[ERR] failed udp receive: %v", err)
+									}
 									return
 								}
 								sessionsMu.Lock()
@@ -716,8 +649,4 @@ func handleSocks5UDP(ctx context.Context, tcpConn net.Conn) error {
 	// Keep TCP connection alive until client closes it
 	_, err = io.Copy(io.Discard, tcpConn)
 	return err
-}
-
-// handleUDPThroughHysteria is no longer used individually as logic moved to handleSocks5UDP for session caching
-func handleUDPThroughHysteria(udpConn net.PacketConn, appAddr net.Addr, data []byte, host string, port uint16, targetAddr string) {
 }

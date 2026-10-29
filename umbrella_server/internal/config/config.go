@@ -2,8 +2,6 @@ package config
 
 import (
 	importRand "crypto/rand"
-	"encoding/base64"
-	"encoding/hex"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -15,20 +13,39 @@ type Config struct {
 	Dest     string `yaml:"dest"`
 	Debug    bool   `yaml:"debug"`
 
+	Imap struct {
+		Gmail struct {
+			Login    string `yaml:"login"`
+			Password string `yaml:"password"`
+		} `yaml:"gmail"`
+	} `yaml:"imap"`
+
 	Xhttp struct {
-		AuthKey string `yaml:"auth-key"`
-		Path    string `yaml:"path"`
+		Path string `yaml:"path"`
 	} `yaml:"xhttp"`
 
-	Xtls struct {
-		PrivateKey  string `yaml:"private-key"`
-		ShortId     string `yaml:"short-id"`
-		ServerNames string `yaml:"server-names"`
-	} `yaml:"xtls"`
+	Hysteria struct {
+		AuthPassword string `yaml:"auth-password"`
+	} `yaml:"hysteria"`
+
+	Torrent struct {
+		AuthKey  string `yaml:"auth-key"`
+		InfoHash string `yaml:"info-hash"`
+	} `yaml:"torrent"`
+}
+
+type ClientConfig struct {
+	Protocol string `yaml:"protocol"`
+	Server   string `yaml:"server"`
+	SNI      string `yaml:"sni"`
+
+	Xhttp struct {
+		Quic bool   `yaml:"quic"`
+		Path string `yaml:"path"`
+		Mode string `yaml:"mode"` // stream-one, stream-up, packet-up
+	} `yaml:"xhttp"`
 
 	Hysteria struct {
-		QuicPort     string `yaml:"quic-port"`
-		AuthKey      string `yaml:"auth-key"`
 		AuthPassword string `yaml:"auth-password"`
 	} `yaml:"hysteria"`
 
@@ -48,11 +65,7 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 
-	cfg := &Config{
-		Protocol: "xtls",
-		Port:     "443",
-		Dest:     "samsung.com:443",
-	}
+	cfg := &Config{}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, err
@@ -70,12 +83,15 @@ func createDefaultConfig(path string) (*Config, error) {
 	importRand.Read(shortId)
 
 	cfg := &Config{
-		Protocol: "xtls",
+		Protocol: "xhttp",
 		Port:     "443",
-		Dest:     "samsung.com:443",
+		Dest:     "github.com:443",
+		Xhttp: struct {
+			Path string "yaml:\"path\""
+		}{
+			Path: "/8f9e0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f/data",
+		},
 	}
-	cfg.Xtls.PrivateKey = base64.StdEncoding.EncodeToString(privKey)
-	cfg.Xtls.ShortId = hex.EncodeToString(shortId)
 
 	data, err := yaml.Marshal(cfg)
 	if err != nil {

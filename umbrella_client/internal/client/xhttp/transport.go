@@ -2,16 +2,11 @@ package xhttp
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/apernet/hysteria/core/v2/congestion"
@@ -22,96 +17,9 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// Глобальный флаг активации IP на сервере
-var isActivated atomic.Bool
-
-// --- QUIC (H3) CID Generator ---
-
-type customCIDGenerator struct {
-	authKey []byte
-	host    string
-}
-
-func (g *customCIDGenerator) GenerateConnectionID() (quic.ConnectionID, error) {
-	// Если уже активированы — выдаем обычный случайный ID (как делает стандартный quic-go)
-	if isActivated.Load() {
-		b := make([]byte, 20)
-		_, _ = rand.Read(b)
-		return quic.ConnectionIDFromBytes(b), nil
-	}
-
-	rnd := make([]byte, 5)
-	_, _ = rand.Read(rnd)
-
-	// Минуты с начала года
-	now := time.Now().UTC()
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	minutes := uint32(now.Sub(yearStart).Minutes())
-
-	minBytes := make([]byte, 3)
-	minBytes[0], minBytes[1], minBytes[2] = byte(minutes>>16), byte(minutes>>8), byte(minutes)
-
-	// XOR маскировка времени
-	maskedTime := make([]byte, 3)
-	for i := 0; i < 3; i++ {
-		maskedTime[i] = minBytes[i] ^ rnd[i]
-	}
-
-	// HMAC подпись
-	mac := hmac.New(sha256.New, g.authKey)
-	mac.Write(rnd)
-	mac.Write(minBytes)
-	mac.Write([]byte(g.host))
-	signature := mac.Sum(nil)[:12]
-
-	// CID: [Rnd:5][MaskedTime:3][Signature:12] = 20 байт
-	cid := make([]byte, 20)
-	copy(cid[0:5], rnd)
-	copy(cid[5:8], maskedTime)
-	copy(cid[8:20], signature)
-
-	return quic.ConnectionIDFromBytes(cid), nil
-}
-
-func (g *customCIDGenerator) ConnectionIDLen() int {
-	return 20
-}
-
-// --- TLS (H2) Auth Helper ---
-
-func generateTLSMagicSessionID(authKey []byte, host string) []byte {
-	rnd := make([]byte, 5)
-	_, _ = rand.Read(rnd)
-
-	now := time.Now().UTC()
-	yearStart := time.Date(now.Year(), 1, 1, 0, 0, 0, 0, time.UTC)
-	minutes := uint32(now.Sub(yearStart).Minutes())
-
-	minBytes := []byte{byte(minutes >> 16), byte(minutes >> 8), byte(minutes)} // 3 байта
-
-	maskedTime := make([]byte, 3)
-	for i := 0; i < 3; i++ {
-		maskedTime[i] = minBytes[i] ^ rnd[i]
-	}
-
-	mac := hmac.New(sha256.New, authKey)
-	mac.Write(rnd)
-	mac.Write(minBytes)
-	mac.Write([]byte(host))
-	signature := mac.Sum(nil)[:24] // Нужно 24 байта
-
-	sid := make([]byte, 32)
-	copy(sid[0:5], rnd)
-	copy(sid[5:8], maskedTime)
-	copy(sid[8:32], signature)
-	return sid
-}
-
 // --- Transport Factory ---
 
-func NewTransport(serverAddr string, host string, alpn []string, authKeyHex string) http.RoundTripper {
-	authKey, _ := hex.DecodeString(authKeyHex)
-
+func NewTransport(serverAddr string, host string, alpn []string) http.RoundTripper {
 	// 1. Режим HTTP/3 (QUIC)
 	if len(alpn) == 1 && alpn[0] == "h3" {
 
@@ -126,10 +34,6 @@ func NewTransport(serverAddr string, host string, alpn []string, authKeyHex stri
 		tr := &quic.Transport{
 			Conn: udpConn,
 		}
-
-		// Если мы еще не активированы, ставим наш магический генератор
-		magicGen := &customCIDGenerator{authKey: authKey, host: host}
-		tr.ConnectionIDGenerator = magicGen
 
 		// Создаем базовый TLS конфиг для H3
 		h3TlsCfg := &tls.Config{
@@ -189,11 +93,6 @@ func NewTransport(serverAddr string, host string, alpn []string, authKeyHex stri
 					log.Printf("[DEBUG] QUIC DialEarly error: %v", err)
 				}
 
-				if err == nil && !isActivated.Load() {
-					isActivated.Store(true)
-					log.Printf("[INFO] xhttp: H3 IP activation successful via Knock")
-				}
-
 				congestion.UseBBR(conn, bbr.Profile("aggressive"))
 				// or
 				// var speedMbps uint64 = 100
@@ -226,22 +125,10 @@ func NewTransport(serverAddr string, host string, alpn []string, authKeyHex stri
 				InsecureSkipVerify: true,
 			}, utls.HelloChrome_Auto)
 
-			uConn.BuildHandshakeState()
-
-			if !isActivated.Load() {
-				uConn.HandshakeState.Hello.SessionId = generateTLSMagicSessionID(authKey, host)
-			} else {
-				b := make([]byte, 32)
-				_, _ = rand.Read(b)
-				uConn.HandshakeState.Hello.SessionId = b
-			}
-
 			if err := uConn.HandshakeContext(ctx); err != nil {
 				_ = rawConn.Close()
 				return nil, err
 			}
-			log.Printf("[INFO] xhttp: H2 IP activation successful via Knock")
-			isActivated.Store(true)
 			return uConn, nil
 		},
 		// Настройки мультиплексирования H2

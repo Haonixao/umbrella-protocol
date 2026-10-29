@@ -168,11 +168,11 @@ func (c *Client) Close() error {
 	}
 
 	if t, ok := c.transport.(*http.Transport); ok {
-		t.CloseIdleConnections()
+		go t.CloseIdleConnections()
 	}
 
 	if t, ok := c.transport.(*http3.Transport); ok {
-		_ = t.Close()
+		go t.Close()
 	}
 
 	return nil
@@ -194,10 +194,7 @@ func (c *Client) Dial(ctx context.Context, isUDP bool) (net.Conn, error) {
 		res, err = nil, fmt.Errorf("unknown mode: %s", c.mode)
 	}
 	if err != nil {
-		// Если соединение не удалось, сбрасываем флаг активации.
-		// Возможно, сервер перезагрузился или наш IP вылетел из белого списка.
 		log.Printf("[ERR] Dial: %v", err)
-		isActivated.Store(false)
 		return nil, err
 	}
 	return res, nil
@@ -385,7 +382,7 @@ func NewPacketUpWriter(ctx context.Context, host, path, sessionID string, transp
 		sessionID:             sessionID,
 		transport:             transport,
 		maxEachPostBytes:      64000,
-		minPostsIntervalRange: [2]int{10, 100}, // Пауза между POST-запросами
+		minPostsIntervalRange: [2]int{10, 50}, // Пауза между POST-запросами
 		buf:                   make([]byte, 0, 64000),
 		sem:                   make(chan struct{}, 2),
 		IsUDP:                 isUDP,

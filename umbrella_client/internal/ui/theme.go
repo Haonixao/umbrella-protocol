@@ -140,7 +140,7 @@ var (
 		Foam:          lipgloss.Color(dawnFoam),
 		Iris:          lipgloss.Color(dawnIris),
 		Highlight:     lipgloss.Color(dawnHighlight),
-		HighlightHigh: lipgloss.Color(dawnGold),
+		HighlightHigh: lipgloss.Color(dawnHighlight),
 	}
 
 	RosePineMoon = Theme{
@@ -158,7 +158,7 @@ var (
 		Foam:          lipgloss.Color(moonFoam),
 		Iris:          lipgloss.Color(moonIris),
 		Highlight:     lipgloss.Color(moonHighlight),
-		HighlightHigh: lipgloss.Color(moonLove),
+		HighlightHigh: lipgloss.Color(moonHighlight),
 	}
 
 	CatppuccinLatte = Theme{
@@ -176,7 +176,7 @@ var (
 		Foam:          lipgloss.Color(latteFoam),
 		Iris:          lipgloss.Color(latteIris),
 		Highlight:     lipgloss.Color(latteHighlight),
-		HighlightHigh: lipgloss.Color(latteGold),
+		HighlightHigh: lipgloss.Color(latteHighlight),
 	}
 
 	CatppuccinFrappe = Theme{
@@ -194,7 +194,7 @@ var (
 		Foam:          lipgloss.Color(frappeFoam),
 		Iris:          lipgloss.Color(frappeIris),
 		Highlight:     lipgloss.Color(frappeHighlight),
-		HighlightHigh: lipgloss.Color(frappeGold),
+		HighlightHigh: lipgloss.Color(frappeHighlight),
 	}
 
 	CatppuccinMacchiato = Theme{
@@ -212,7 +212,7 @@ var (
 		Foam:          lipgloss.Color(macchiatoFoam),
 		Iris:          lipgloss.Color(macchiatoIris),
 		Highlight:     lipgloss.Color(macchiatoHighlight),
-		HighlightHigh: lipgloss.Color(macchiatoGold),
+		HighlightHigh: lipgloss.Color(macchiatoHighlight),
 	}
 
 	CatppuccinMocha = Theme{
@@ -230,7 +230,7 @@ var (
 		Foam:          lipgloss.Color(mochaFoam),
 		Iris:          lipgloss.Color(mochaIris),
 		Highlight:     lipgloss.Color(mochaHighlight),
-		HighlightHigh: lipgloss.Color(mochaGold),
+		HighlightHigh: lipgloss.Color(mochaHighlight),
 	}
 )
 
